@@ -911,6 +911,7 @@ name = "code-native"
 version = "0.1.0"
 dependencies = [
  "code-exthost",
+ "flate2",
  "futures",
  "gpui",
  "serde_json",

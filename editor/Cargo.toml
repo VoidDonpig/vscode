@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Native (gpui) VS Code front end; extensions run in the real extension host via code-exthost."
 
+[build-dependencies]
+flate2 = "1"
+
 [dependencies]
 gpui = { version = "0.2.2", default-features = false, features = ["x11", "wayland", "font-kit"] }
 code-exthost = { path = "../exthost" }

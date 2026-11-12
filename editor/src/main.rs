@@ -4,15 +4,20 @@
  *--------------------------------------------------------------------------------------------*/
 
 //! Native VS Code front end drawn with gpui (no Electron, no webview). Extensions run unmodified
-//! in VS Code's Node extension host, driven through `code-exthost`.
+//! in VS Code's Node extension host, driven through `code-exthost`. The layout, sizes, fonts,
+//! colors (default theme "Dark 2026") and icons (codicons, vs-seti) follow the real workbench.
 //!
-//! Usage: `code-native [file]`
-//! - `CODE_NATIVE_EXTENSIONS`: `:`-separated extension folders, or folders of extensions
-//!   (default: `~/.vscode-oss/extensions`).
-//! - `VSCODE_NODE`: node binary (default `node`).
+//! Usage: `code-native [folder] [files...]` (like `code`: the first folder is the workspace, files open in tabs)
+//! - `CODE_NATIVE_EXTENSIONS`: extra `:`-separated extension folders (or folders of extensions);
+//!   default `~/.vscode-oss/extensions`. Built-in extensions come from `<root>/extensions`.
+//! - `VSCODE_NODE`: node binary (default `node`). `VSCODE_ROOT`: VS Code checkout (default: this repo).
 
 mod buffer;
+mod icons;
+mod theme;
 
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,20 +26,33 @@ use code_exthost::{describe_extension, ExtHost, Options};
 use futures::channel::mpsc::{unbounded, UnboundedSender};
 use futures::StreamExt;
 use gpui::{
-	div, font, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton,
-	MouseDownEvent, ScrollStrategy, SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+	div, img, prelude::*, px, size, uniform_list, App, Application, Bounds, Context, Div, FocusHandle, FontWeight, Hsla, KeyDownEvent,
+	MouseButton, MouseDownEvent, ScrollStrategy, SharedString, UniformListScrollHandle, Window, WindowBounds, WindowDecorations,
+	WindowOptions,
 };
+use icons::FileIcons;
 use serde_json::{json, Value};
+use theme::Theme;
 
-#[cfg(target_os = "macos")]
-const MONO: &str = "Menlo";
-#[cfg(windows)]
-const MONO: &str = "Consolas";
-#[cfg(not(any(target_os = "macos", windows)))]
-const MONO: &str = "DejaVu Sans Mono";
+// Workbench metrics, measured from the web workbench of this repo (1200x800, Dark 2026).
+const TITLE_H: f32 = 35.;
+const GAP: f32 = 4.;
+const ACTIVITY_W: f32 = 44.;
+const SIDEBAR_W: f32 = 300.;
+const STATUS_H: f32 = 28.;
+const TABS_H: f32 = 32.;
+const BREADCRUMBS_H: f32 = 22.;
+const ROW_H: f32 = 22.;
+const UI_SIZE: f32 = 13.;
+// Editor defaults on Linux: fontSize 14, lineHeight = round(14 * 1.35).
 const FONT_SIZE: f32 = 14.;
-const LINE_H: f32 = 20.;
-const GUTTER: f32 = 56.;
+const LINE_H: f32 = 19.;
+const GUTTER: f32 = 70.;
+const LINE_NUMBER_RIGHT: f32 = 44.;
+const MINIMAP_W: f32 = 88.;
+const SCROLLBAR_W: f32 = 14.;
+/// files.exclude defaults.
+const EXCLUDED: &[&str] = &[".git", ".svn", ".hg", ".DS_Store", "Thumbs.db", "CVS"];
 
 enum HostEvent {
 	Ready(Arc<ExtHost>),
@@ -44,6 +62,7 @@ enum HostEvent {
 
 struct Provider {
 	handle: Value,
+	selector: Value,
 	triggers: Vec<String>,
 }
 
@@ -53,59 +72,101 @@ struct Popup {
 	selected: usize,
 }
 
-struct Editor {
-	focus: FocusHandle,
-	buf: Buffer,
-	path: Option<PathBuf>,
+struct Doc {
+	path: PathBuf,
 	uri: Value,
 	lang: String,
-	host: Option<Arc<ExtHost>>,
-	providers: Vec<Provider>,
-	/// Document as the extension host last saw it: (full range, UTF-16 length).
-	synced: ((usize, usize, usize, usize), usize),
+	buf: Buffer,
+	crlf: bool,
 	version: u64,
 	dirty: bool,
-	popup: Option<Popup>,
+	/// Document as the extension host last saw it: (full range, UTF-16 length).
+	synced: ((usize, usize, usize, usize), usize),
 	scroll: UniformListScrollHandle,
+}
+
+/// One `contributes.languages` entry.
+struct Language {
+	id: String,
+	name: String,
+	extensions: Vec<String>,
+	filenames: Vec<String>,
+}
+
+struct Fonts {
+	ui: SharedString,
+	mono: SharedString,
+}
+
+struct Workbench {
+	focus: FocusHandle,
+	theme: Theme,
+	file_icons: FileIcons,
+	fonts: Fonts,
+	languages: Vec<Language>,
+	root: Option<PathBuf>,
+	dir_cache: HashMap<PathBuf, Vec<(String, bool)>>,
+	expanded: HashSet<PathBuf>,
+	docs: Vec<Doc>,
+	active: Option<usize>,
+	host: Option<Arc<ExtHost>>,
+	providers: Vec<Provider>,
+	popup: Option<Popup>,
 	char_w: f32,
-	status: SharedString,
 }
 
 fn file_uri(path: &Path) -> Value {
 	json!({ "$mid": 1, "scheme": "file", "authority": "", "path": path.to_string_lossy(), "query": "", "fragment": "" })
 }
 
-fn extension_dirs() -> Vec<PathBuf> {
-	let roots: Vec<PathBuf> = match std::env::var_os("CODE_NATIVE_EXTENSIONS") {
+/// Sub-folders of `root` that contain a package.json.
+fn extension_folders(root: &Path) -> Vec<PathBuf> {
+	let mut found: Vec<PathBuf> = std::fs::read_dir(root)
+		.map(|it| it.flatten().map(|e| e.path()).filter(|p| p.join("package.json").is_file()).collect())
+		.unwrap_or_default();
+	found.sort();
+	found
+}
+
+/// Built-in extensions (`<root>/extensions/*`), then user extensions.
+fn extension_dirs(app_root: &Path) -> Vec<PathBuf> {
+	let mut dirs = extension_folders(&app_root.join("extensions"));
+	let user: Vec<PathBuf> = match std::env::var_os("CODE_NATIVE_EXTENSIONS") {
 		Some(v) => std::env::split_paths(&v).collect(),
-		None => std::env::var_os("HOME").map(|h| vec![Path::new(&h).join(".vscode-oss/extensions")]).unwrap_or_default(),
+		None => std::env::var_os("HOME").map(|h| Path::new(&h).join(".vscode-oss/extensions")).into_iter().collect(),
 	};
-	let mut dirs = Vec::new();
-	for root in roots {
+	for root in user {
 		if root.join("package.json").is_file() {
 			dirs.push(root);
-		} else if let Ok(entries) = std::fs::read_dir(&root) {
-			dirs.extend(entries.flatten().map(|e| e.path()).filter(|p| p.join("package.json").is_file()));
+		} else {
+			dirs.extend(extension_folders(&root));
 		}
 	}
 	dirs
 }
 
-/// Language id from the extensions' `contributes.languages`, like VS Code's language service.
-fn language_for(path: Option<&Path>, extensions: &[Value]) -> String {
-	let Some(name) = path.and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_lowercase()) else {
-		return "plaintext".into();
-	};
-	for ext in extensions {
-		for lang in ext["contributes"]["languages"].as_array().into_iter().flatten() {
-			let hit = lang["extensions"].as_array().into_iter().flatten().filter_map(Value::as_str).any(|e| name.ends_with(&e.to_lowercase()))
-				|| lang["filenames"].as_array().into_iter().flatten().filter_map(Value::as_str).any(|f| f.eq_ignore_ascii_case(&name));
-			if let (true, Some(id)) = (hit, lang["id"].as_str()) {
-				return id.into();
-			}
-		}
-	}
-	"plaintext".into()
+fn languages_of(packages: &[Value]) -> Vec<Language> {
+	let strings = |v: &Value| v.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(str::to_lowercase)).collect::<Vec<_>>();
+	packages
+		.iter()
+		.flat_map(|p| p["contributes"]["languages"].as_array().cloned().unwrap_or_default())
+		.filter_map(|l| {
+			let id = l["id"].as_str()?.to_string();
+			let name = l["aliases"][0].as_str().unwrap_or(&id).to_string();
+			Some(Language { name, extensions: strings(&l["extensions"]), filenames: strings(&l["filenames"]), id })
+		})
+		.collect()
+}
+
+/// Language id for a file, like the workbench's language service (file names, then the longest matching extension).
+fn language_for(path: &Path, languages: &[Language]) -> String {
+	let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+	let ext_len = |l: &Language| l.extensions.iter().filter(|e| name.ends_with(e.as_str())).map(|e| e.len()).max();
+	languages
+		.iter()
+		.find(|l| l.filenames.contains(&name))
+		.or_else(|| languages.iter().filter(|l| ext_len(l).is_some()).max_by_key(|l| ext_len(l)))
+		.map_or("plaintext".into(), |l| l.id.clone())
 }
 
 /// Does a DocumentSelector (as sent by `$register*Provider`) match this document?
@@ -159,58 +220,230 @@ fn strip_snippet(s: &str) -> String {
 	out
 }
 
-impl Editor {
-	fn new(path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
-		let text = path.as_deref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-		let ext_dirs = extension_dirs();
-		let packages: Vec<Value> = ext_dirs.iter().filter_map(|d| describe_extension(d).ok().map(|(_, v)| v)).collect();
-		let lang = language_for(path.as_deref(), &packages);
-		let uri = match &path {
-			Some(p) => file_uri(&std::path::absolute(p).unwrap_or(p.clone())),
-			None => json!({ "$mid": 1, "scheme": "untitled", "authority": "", "path": "Untitled-1", "query": "", "fragment": "" }),
+/// `editor.detectIndentation`, simplified: tabs, or the smallest leading-space run.
+fn indentation_label(lines: &[String]) -> String {
+	if lines.iter().filter(|l| l.starts_with('\t')).count() > lines.iter().filter(|l| l.starts_with(' ')).count() {
+		return "Tab Size: 4".into();
+	}
+	let n = lines.iter().map(|l| l.len() - l.trim_start_matches(' ').len()).filter(|n| *n > 0 && *n <= 8).min().unwrap_or(4);
+	format!("Spaces: {n}")
+}
+
+/// Same sort as the explorer's default: folders first, then case-insensitive names.
+fn read_dir_sorted(dir: &Path) -> Vec<(String, bool)> {
+	let mut entries: Vec<(String, bool)> = std::fs::read_dir(dir)
+		.map(|it| {
+			it.flatten()
+				.map(|e| (e.file_name().to_string_lossy().into_owned(), e.path().is_dir()))
+				.filter(|(n, _)| !EXCLUDED.contains(&n.as_str()))
+				.collect()
+		})
+		.unwrap_or_default();
+	entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+	entries
+}
+
+/// Explorer rows below `dir`, depth-first: (depth, path, is_dir).
+fn flatten(cache: &HashMap<PathBuf, Vec<(String, bool)>>, expanded: &HashSet<PathBuf>, dir: &Path, depth: usize) -> Vec<(usize, PathBuf, bool)> {
+	let mut out = Vec::new();
+	for (name, is_dir) in cache.get(dir).cloned().unwrap_or_else(|| read_dir_sorted(dir)) {
+		let p = dir.join(name);
+		out.push((depth, p.clone(), is_dir));
+		if is_dir && expanded.contains(&p) {
+			out.extend(flatten(cache, expanded, &p, depth + 1));
+		}
+	}
+	out
+}
+
+fn system_fonts(cx: &App) -> Fonts {
+	#[cfg(target_os = "linux")]
+	{
+		// The workbench asks for `system-ui` / `'Droid Sans Mono', monospace`; resolve them like the browser does.
+		let fc = |pattern: &str, fallback: &str| -> SharedString {
+			std::process::Command::new("fc-match")
+				.args(["-f", "%{family[0]}", pattern])
+				.output()
+				.ok()
+				.and_then(|o| String::from_utf8(o.stdout).ok())
+				.filter(|s| !s.is_empty())
+				.unwrap_or_else(|| fallback.into())
+				.into()
 		};
-		let buf = Buffer::new(&text);
-		let synced = (buf.full_range(), text.encode_utf16().count());
+		let mono = if cx.text_system().all_font_names().iter().any(|f| f == "Droid Sans Mono") { "Droid Sans Mono".into() } else { fc("monospace", "DejaVu Sans Mono") };
+		Fonts { ui: fc("sans-serif", "DejaVu Sans"), mono }
+	}
+	#[cfg(target_os = "macos")]
+	{
+		let _ = cx;
+		Fonts { ui: ".SystemUIFont".into(), mono: "Menlo".into() }
+	}
+	#[cfg(windows)]
+	{
+		let _ = cx;
+		Fonts { ui: "Segoe UI".into(), mono: "Consolas".into() }
+	}
+}
+
+fn icon(ch: char, size: f32, color: Hsla) -> Div {
+	div()
+		.flex()
+		.flex_none()
+		.items_center()
+		.justify_center()
+		.font_family(icons::CODICON_FONT)
+		.text_size(px(size))
+		.line_height(px(size))
+		.text_color(color)
+		.child(ch.to_string())
+}
+
+/// A 22x22 toolbar button with a 16px codicon, as in title and editor toolbars.
+fn action(ch: char, color: Hsla) -> Div {
+	icon(ch, 16., color).size(px(22.)).rounded(px(4.))
+}
+
+fn send_open(host: &ExtHost, doc: &Doc) {
+	let _ = host.notify("ExtHostDocumentsAndEditors", "$acceptDocumentsAndEditorsDelta", vec![json!({
+		"addedDocuments": [{
+			"uri": doc.uri, "versionId": doc.version, "lines": doc.buf.lines, "EOL": if doc.crlf { "\r\n" } else { "\n" },
+			"languageId": doc.lang, "isDirty": doc.dirty, "encoding": "utf8",
+		}]
+	})]);
+}
+
+fn start_host(app_root: PathBuf, extensions: Vec<PathBuf>, tx: UnboundedSender<HostEvent>) {
+	std::thread::spawn(move || {
+		let events = tx.clone();
+		let handler = Box::new(move |proxy: &str, method: &str, args: &[Value]| {
+			if (proxy, method) == ("MainThreadLanguageFeatures", "$registerCompletionsProvider") {
+				let triggers = args[2].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(String::from)).collect();
+				let _ = events.unbounded_send(HostEvent::CompletionProvider { handle: args[0].clone(), selector: args[1].clone(), triggers });
+			}
+			Ok(None)
+		});
+		let opts = Options {
+			node: std::env::var_os("VSCODE_NODE").unwrap_or("node".into()).into(),
+			app_root,
+			extensions,
+			data_dir: std::env::temp_dir().join("code-native"),
+		};
+		let _ = tx.unbounded_send(match ExtHost::start(opts, handler) {
+			Ok(h) => HostEvent::Ready(Arc::new(h)),
+			Err(e) => HostEvent::Failed(e.to_string()),
+		});
+	});
+}
+
+impl Workbench {
+	fn new(args: Vec<PathBuf>, cx: &mut Context<Self>) -> Self {
+		let app_root = std::env::var_os("VSCODE_ROOT").map(PathBuf::from).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
+		let app_root = app_root.canonicalize().unwrap_or(app_root);
+		let ext_dirs = extension_dirs(&app_root);
+		let packages: Vec<Value> = ext_dirs.iter().filter_map(|d| describe_extension(d).ok().map(|(_, v)| v)).collect();
+
+		let args: Vec<PathBuf> = args.into_iter().map(|a| std::path::absolute(&a).unwrap_or(a)).collect();
+		let files: Vec<PathBuf> = args.iter().filter(|a| !a.is_dir()).cloned().collect();
+		let root = args.iter().find(|a| a.is_dir()).cloned().or_else(|| files.first().and_then(|f| f.parent()).map(Path::to_path_buf));
 
 		let (tx, mut rx) = unbounded();
-		start_host(ext_dirs.clone(), tx);
+		start_host(app_root.clone(), ext_dirs, tx);
 		cx.spawn(async move |this, cx| {
 			while let Some(ev) = rx.next().await {
-				if this.update(cx, |ed, cx| ed.on_host_event(ev, cx)).is_err() {
+				if this.update(cx, |wb, cx| wb.on_host_event(ev, cx)).is_err() {
 					break;
 				}
 			}
 		})
 		.detach();
 
-		Editor {
+		let mut wb = Workbench {
 			focus: cx.focus_handle(),
-			buf,
-			path,
-			uri,
-			status: format!("{lang} · starting extension host ({} extensions)…", ext_dirs.len()).into(),
-			lang,
+			theme: Theme::load(&app_root.join("extensions/theme-defaults/themes/2026-dark.json")),
+			file_icons: FileIcons::load(&app_root.join("extensions/theme-seti/icons/vs-seti-icon-theme.json")),
+			fonts: system_fonts(cx),
+			languages: languages_of(&packages),
+			root: root.clone(),
+			dir_cache: HashMap::new(),
+			expanded: root.into_iter().collect(),
+			docs: Vec::new(),
+			active: None,
 			host: None,
 			providers: Vec::new(),
-			synced,
-			version: 1,
-			dirty: false,
 			popup: None,
-			scroll: UniformListScrollHandle::new(),
 			char_w: FONT_SIZE * 0.6,
+		};
+		for f in files {
+			wb.open(f, cx);
 		}
+		wb
+	}
+
+	fn doc(&self) -> Option<&Doc> {
+		self.active.and_then(|i| self.docs.get(i))
+	}
+
+	fn doc_mut(&mut self) -> Option<&mut Doc> {
+		self.active.and_then(|i| self.docs.get_mut(i))
+	}
+
+	fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+		if let Some(i) = self.docs.iter().position(|d| d.path == path) {
+			self.active = Some(i);
+		} else {
+			let raw = std::fs::read_to_string(&path).unwrap_or_default();
+			let buf = Buffer::new(&raw);
+			let text = buf.text();
+			let doc = Doc {
+				uri: file_uri(&path),
+				lang: language_for(&path, &self.languages),
+				crlf: raw.contains("\r\n"),
+				synced: (buf.full_range(), text.encode_utf16().count()),
+				buf,
+				path,
+				version: 1,
+				dirty: false,
+				scroll: UniformListScrollHandle::new(),
+			};
+			if let Some(host) = &self.host {
+				send_open(host, &doc);
+				let _ = host.notify("ExtHostExtensionService", "$activateByEvent", vec![json!(format!("onLanguage:{}", doc.lang)), json!(0)]);
+			}
+			self.docs.push(doc);
+			self.active = Some(self.docs.len() - 1);
+		}
+		// Reveal the file in the explorer.
+		if let (Some(root), Some(doc)) = (&self.root, self.doc()) {
+			let mut dirs: Vec<PathBuf> = doc.path.ancestors().skip(1).take_while(|a| a.starts_with(root)).map(Path::to_path_buf).collect();
+			dirs.reverse();
+			self.expanded.extend(dirs);
+		}
+		self.popup = None;
+		cx.notify();
+	}
+
+	fn close(&mut self, i: usize, cx: &mut Context<Self>) {
+		let doc = self.docs.remove(i);
+		if let Some(host) = &self.host {
+			let _ = host.notify("ExtHostDocumentsAndEditors", "$acceptDocumentsAndEditorsDelta", vec![json!({ "removedDocuments": [doc.uri] })]);
+		}
+		self.active = match self.active {
+			_ if self.docs.is_empty() => None,
+			Some(a) if a > i || a == self.docs.len() => Some(a - 1),
+			a => a,
+		};
+		self.popup = None;
+		cx.notify();
 	}
 
 	fn on_host_event(&mut self, ev: HostEvent, cx: &mut Context<Self>) {
 		match ev {
 			HostEvent::Ready(host) => {
-				let _ = host.notify("ExtHostDocumentsAndEditors", "$acceptDocumentsAndEditorsDelta", vec![json!({
-					"addedDocuments": [{
-						"uri": self.uri, "versionId": self.version, "lines": self.buf.lines, "EOL": "\n",
-						"languageId": self.lang, "isDirty": self.dirty, "encoding": "utf8",
-					}]
-				})]);
-				let events = ["*".to_string(), "onStartupFinished".into(), format!("onLanguage:{}", self.lang)];
+				for doc in &self.docs {
+					send_open(&host, doc);
+				}
+				let mut events = vec!["*".to_string(), "onStartupFinished".into()];
+				events.extend(self.docs.iter().map(|d| format!("onLanguage:{}", d.lang)));
 				let h = host.clone();
 				cx.background_spawn(async move {
 					for e in events {
@@ -221,16 +454,9 @@ impl Editor {
 				})
 				.detach();
 				self.host = Some(host);
-				self.status = format!("{} · extension host ready", self.lang).into();
 			}
-			HostEvent::Failed(e) => self.status = format!("extension host failed: {e}").into(),
-			HostEvent::CompletionProvider { handle, selector, triggers } => {
-				let scheme = self.uri["scheme"].as_str().unwrap_or("file");
-				if selector_matches(&selector, &self.lang, scheme) {
-					self.providers.push(Provider { handle, triggers });
-					self.status = format!("{} · {} completion provider(s)", self.lang, self.providers.len()).into();
-				}
-			}
+			HostEvent::Failed(e) => eprintln!("code-native: extension host failed: {e}"),
+			HostEvent::CompletionProvider { handle, selector, triggers } => self.providers.push(Provider { handle, selector, triggers }),
 		}
 		cx.notify();
 	}
@@ -238,43 +464,46 @@ impl Editor {
 	/// Sends the new text to the extension host as a full-document replace.
 	// shortcut: full-document sync per edit; send incremental ranges when large files get slow.
 	fn edited(&mut self, cx: &mut Context<Self>) {
-		self.dirty = true;
-		self.version += 1;
-		let text = self.buf.text();
-		let ((sl, sc, el, ec), old_len) = self.synced;
-		if let Some(host) = &self.host {
+		let host = self.host.clone();
+		let Some(doc) = self.doc_mut() else { return };
+		doc.dirty = true;
+		doc.version += 1;
+		let text = doc.buf.text();
+		let ((sl, sc, el, ec), old_len) = doc.synced;
+		if let Some(host) = host {
 			let _ = host.notify("ExtHostDocuments", "$acceptModelChanged", vec![
-				self.uri.clone(),
+				doc.uri.clone(),
 				json!({
 					"changes": [{
 						"range": { "startLineNumber": sl, "startColumn": sc, "endLineNumber": el, "endColumn": ec },
 						"rangeOffset": 0, "rangeLength": old_len, "text": text,
 					}],
-					"eol": "\n", "versionId": self.version, "isUndoing": false, "isRedoing": false,
+					"eol": "\n", "versionId": doc.version, "isUndoing": false, "isRedoing": false,
 				}),
 				json!(true),
 			]);
 		}
-		self.synced = (self.buf.full_range(), text.encode_utf16().count());
+		doc.synced = (doc.buf.full_range(), text.encode_utf16().count());
 		self.reveal_cursor();
 		cx.notify();
 	}
 
 	fn reveal_cursor(&self) {
-		let state = self.scroll.0.borrow();
+		let Some(doc) = self.doc() else { return };
+		let state = doc.scroll.0.borrow();
 		let (top, height) = (-f32::from(state.base_handle.offset().y), f32::from(state.base_handle.bounds().size.height));
 		drop(state);
-		let y = self.buf.cursor.0 as f32 * LINE_H;
+		let y = doc.buf.cursor.0 as f32 * LINE_H;
 		if y < top {
-			self.scroll.scroll_to_item(self.buf.cursor.0, ScrollStrategy::Top);
+			doc.scroll.scroll_to_item(doc.buf.cursor.0, ScrollStrategy::Top);
 		} else if y + LINE_H > top + height {
-			self.scroll.scroll_to_item(self.buf.cursor.0, ScrollStrategy::Bottom);
+			doc.scroll.scroll_to_item(doc.buf.cursor.0, ScrollStrategy::Bottom);
 		}
 	}
 
 	fn request_completions(&mut self, trigger: Option<String>, cx: &mut Context<Self>) {
-		let Some(host) = self.host.clone() else { return };
-		let (line, col) = self.buf.position_utf16();
+		let (Some(host), Some(doc)) = (self.host.clone(), self.doc()) else { return };
+		let (line, col) = doc.buf.position_utf16();
 		let context = match &trigger {
 			Some(ch) => json!({ "triggerKind": 1, "triggerCharacter": ch }),
 			None => json!({ "triggerKind": 0 }),
@@ -282,10 +511,10 @@ impl Editor {
 		let handles: Vec<Value> = self
 			.providers
 			.iter()
-			.filter(|p| trigger.as_ref().is_none_or(|t| p.triggers.contains(t)))
+			.filter(|p| selector_matches(&p.selector, &doc.lang, "file") && trigger.as_ref().is_none_or(|t| p.triggers.contains(t)))
 			.map(|p| p.handle.clone())
 			.collect();
-		let (uri, version) = (self.uri.clone(), self.version);
+		let (uri, version) = (doc.uri.clone(), doc.version);
 		cx.spawn(async move |this, cx| {
 			let items = cx
 				.background_spawn(async move {
@@ -302,9 +531,9 @@ impl Editor {
 					items
 				})
 				.await;
-			let _ = this.update(cx, |ed, cx| {
-				if ed.version == version && !items.is_empty() {
-					ed.popup = Some(Popup { items, selected: 0 });
+			let _ = this.update(cx, |wb, cx| {
+				if wb.doc().is_some_and(|d| d.version == version) && !items.is_empty() {
+					wb.popup = Some(Popup { items, selected: 0 });
 					cx.notify();
 				}
 			});
@@ -314,26 +543,25 @@ impl Editor {
 
 	/// Items matching the word before the cursor: prefix matches first, then the extension's sortText.
 	fn visible_items(&self) -> Vec<(String, String)> {
-		let prefix = self.buf.word_prefix().to_lowercase();
+		let Some(doc) = self.doc() else { return Vec::new() };
+		let prefix = doc.buf.word_prefix().to_lowercase();
 		let mut items: Vec<_> = self.popup.iter().flat_map(|p| &p.items).filter(|(label, ..)| label.to_lowercase().contains(&prefix)).collect();
 		items.sort_by_key(|(label, _, sort)| (!label.to_lowercase().starts_with(&prefix), sort.as_str()));
 		items.into_iter().take(12).map(|(label, insert, _)| (label.clone(), insert.clone())).collect()
 	}
 
 	fn save(&mut self) {
-		let Some(path) = &self.path else {
-			self.status = "untitled: pass a file path to save".into();
-			return;
-		};
-		match std::fs::write(path, self.buf.text()) {
+		let host = self.host.clone();
+		let Some(doc) = self.doc_mut() else { return };
+		let text = if doc.crlf { doc.buf.text().replace('\n', "\r\n") } else { doc.buf.text() };
+		match std::fs::write(&doc.path, text) {
 			Ok(()) => {
-				self.dirty = false;
-				self.status = format!("saved {}", path.display()).into();
-				if let Some(host) = &self.host {
-					let _ = host.notify("ExtHostDocuments", "$acceptModelSaved", vec![self.uri.clone()]);
+				doc.dirty = false;
+				if let Some(host) = host {
+					let _ = host.notify("ExtHostDocuments", "$acceptModelSaved", vec![doc.uri.clone()]);
 				}
 			}
-			Err(e) => self.status = format!("save failed: {e}").into(),
+			Err(e) => eprintln!("code-native: save failed: {e}"),
 		}
 	}
 
@@ -341,6 +569,15 @@ impl Editor {
 		let k = &ev.keystroke;
 		let m = k.modifiers;
 		let cmd = m.control || m.platform;
+		if k.key == "w" && cmd {
+			if let Some(i) = self.active {
+				self.close(i, cx);
+			}
+			return;
+		}
+		if self.doc().is_none() {
+			return;
+		}
 
 		if self.popup.is_some() {
 			let items = self.visible_items();
@@ -351,8 +588,9 @@ impl Editor {
 				"enter" | "tab" if !items.is_empty() => {
 					let insert = items[popup.selected.min(items.len() - 1)].1.clone();
 					self.popup = None;
-					let prefix = self.buf.word_prefix().chars().count();
-					self.buf.replace_prefix(prefix, &insert);
+					let buf = &mut self.doc_mut().unwrap().buf;
+					let prefix = buf.word_prefix().chars().count();
+					buf.replace_prefix(prefix, &insert);
 					return self.edited(cx);
 				}
 				"escape" => return { self.popup = None; cx.notify() },
@@ -360,44 +598,46 @@ impl Editor {
 			}
 		}
 
+		let buf = &mut self.doc_mut().unwrap().buf;
 		match k.key.as_str() {
 			"s" if cmd => self.save(),
 			"space" if cmd => self.request_completions(None, cx),
 			"v" if cmd => {
 				if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-					self.buf.insert(&text.replace("\r\n", "\n"));
+					buf.insert(&text.replace("\r\n", "\n"));
 					self.edited(cx);
 				}
 			}
-			"left" => self.buf.move_by(0, -1),
-			"right" => self.buf.move_by(0, 1),
-			"up" => self.buf.move_by(-1, 0),
-			"down" => self.buf.move_by(1, 0),
-			"home" => self.buf.home(),
-			"end" => self.buf.end(),
+			"left" => buf.move_by(0, -1),
+			"right" => buf.move_by(0, 1),
+			"up" => buf.move_by(-1, 0),
+			"down" => buf.move_by(1, 0),
+			"home" => buf.home(),
+			"end" => buf.end(),
 			"backspace" => {
-				self.buf.backspace();
+				buf.backspace();
 				self.edited(cx);
 			}
 			"delete" => {
-				self.buf.delete();
+				buf.delete();
 				self.edited(cx);
 			}
 			"enter" => {
-				self.buf.insert("\n");
+				buf.insert("\n");
 				self.edited(cx);
 			}
 			"tab" => {
-				self.buf.insert("    ");
+				buf.insert("    ");
 				self.edited(cx);
 			}
 			"escape" => {}
 			// shortcut: text arrives via key_char, so IME composition is not supported yet (needs gpui's InputHandler).
 			_ if !cmd && !m.alt => {
 				if let Some(ch) = k.key_char.clone() {
-					self.buf.insert(&ch);
+					buf.insert(&ch);
 					self.edited(cx);
-					let trigger = self.providers.iter().any(|p| p.triggers.contains(&ch));
+					let lang = self.doc().map(|d| d.lang.clone()).unwrap_or_default();
+					let trigger = self.providers.iter().any(|p| p.triggers.contains(&ch) && selector_matches(&p.selector, &lang, "file"));
 					if trigger {
 						self.request_completions(Some(ch), cx);
 					} else if ch.chars().all(|c| c.is_alphanumeric() || c == '_') {
@@ -411,7 +651,7 @@ impl Editor {
 			}
 			_ => {}
 		}
-		if self.popup.as_ref().is_some_and(|_| self.visible_items().is_empty()) {
+		if self.popup.is_some() && self.visible_items().is_empty() {
 			self.popup = None;
 		}
 		self.reveal_cursor();
@@ -419,110 +659,462 @@ impl Editor {
 	}
 
 	fn click_line(&mut self, line: usize, ev: &MouseDownEvent, cx: &mut Context<Self>) {
-		let col = ((f32::from(ev.position.x) - GUTTER) / self.char_w).round().max(0.) as usize;
-		self.buf.cursor = (line, col.min(self.buf.lines[line].chars().count()));
+		let text_left = GAP + ACTIVITY_W + SIDEBAR_W + GAP + 1. + GUTTER;
+		let col = ((f32::from(ev.position.x) - text_left) / self.char_w).round().max(0.) as usize;
+		if let Some(doc) = self.doc_mut() {
+			doc.buf.cursor = (line, col.min(doc.buf.lines[line].chars().count()));
+		}
 		self.popup = None;
 		cx.notify();
 	}
-}
 
-fn start_host(extensions: Vec<PathBuf>, tx: UnboundedSender<HostEvent>) {
-	std::thread::spawn(move || {
-		let app_root = std::env::var_os("VSCODE_ROOT")
-			.map(PathBuf::from)
-			.unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
-		let events = tx.clone();
-		let handler = Box::new(move |proxy: &str, method: &str, args: &[Value]| {
-			if (proxy, method) == ("MainThreadLanguageFeatures", "$registerCompletionsProvider") {
-				let triggers = args[2].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(String::from)).collect();
-				let _ = events.unbounded_send(HostEvent::CompletionProvider { handle: args[0].clone(), selector: args[1].clone(), triggers });
-			}
-			Ok(None)
-		});
-		let opts = Options {
-			node: std::env::var_os("VSCODE_NODE").unwrap_or("node".into()).into(),
-			app_root: app_root.canonicalize().unwrap_or(app_root),
-			extensions,
-			data_dir: std::env::temp_dir().join("code-native"),
-		};
-		let _ = tx.unbounded_send(match ExtHost::start(opts, handler) {
-			Ok(h) => HostEvent::Ready(Arc::new(h)),
-			Err(e) => HostEvent::Failed(e.to_string()),
-		});
-	});
-}
-
-impl Render for Editor {
-	fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-		let ts = window.text_system();
-		if let Ok(adv) = ts.advance(ts.resolve_font(&font(MONO)), px(FONT_SIZE), 'm') {
-			self.char_w = f32::from(adv.width);
+	fn file_icon(&self, name: &str, lang: &str) -> Div {
+		let fg = self.theme.c("foreground", 0xbfbfbfff);
+		match self.file_icons.for_file(name, lang) {
+			// Seti glyphs are drawn at 150% of the 16px icon box, centered.
+			Some((ch, color)) => div()
+				.flex()
+				.flex_none()
+				.items_center()
+				.justify_center()
+				.w(px(16.))
+				.h(px(ROW_H))
+				.font_family(icons::SETI_FONT)
+				.text_size(px(24.))
+				.text_color(color.unwrap_or(fg))
+				.child(ch.to_string()),
+			None => div().w(px(16.)),
 		}
-		let (cl, cc) = self.buf.cursor;
-		let items = self.visible_items();
-		let selected = self.popup.as_ref().map_or(0, |p| p.selected.min(items.len().saturating_sub(1)));
-		let scroll_y = f32::from(self.scroll.0.borrow().base_handle.offset().y);
-		let title = self.path.as_ref().map_or("Untitled-1".into(), |p| p.display().to_string());
+	}
+
+	fn render_titlebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+		let t = &self.theme;
+		let fg = t.c("titleBar.activeForeground", 0x8c8c8cff);
+		let title = self.root.as_ref().and_then(|r| r.file_name()).map_or("Code - OSS".into(), |n| n.to_string_lossy().to_string());
+		let maximized = window.is_maximized();
+
+		// Title bar flex layout from titlebarpart.css (has-center): left 20% grow 2, center fit-content
+		// with 10px margins, right 20% grow 2 (min-content). The menu bar overflows into "…".
+		let width = f32::from(window.viewport_size().width);
+		let search_w = (width * 0.38).min(600.);
+		let center_w = 20. + 20. + 6. + search_w + 2. + 6.;
+		let right_min = 4. * 22. + 3. * 4. + 4. + 3. * 46.;
+		let (base_l, base_r) = (width * 0.2, (width * 0.2).max(right_min));
+		let left_w = base_l + ((width - base_l - base_r - center_w - 20.) / 2.).max(0.);
+		let ts = window.text_system();
+		let ui_font = ts.resolve_font(&gpui::font(self.fonts.ui.clone()));
+		let text_w = |s: &str| s.chars().filter_map(|c| ts.advance(ui_font, px(UI_SIZE), c).ok()).map(|a| f32::from(a.width)).sum::<f32>();
+		let all_menus = ["File", "Edit", "Selection", "View", "Go", "Run", "Terminal", "Help"];
+		let mut used = 35.;
+		let mut menus = Vec::new();
+		for (i, m) in all_menus.iter().enumerate() {
+			let w = text_w(m) + 16.;
+			let reserve = if i + 1 < all_menus.len() { 30. } else { 0. };
+			if used + w + reserve > left_w {
+				break;
+			}
+			used += w;
+			menus.push(*m);
+		}
+		let overflow = menus.len() < all_menus.len();
 
 		div()
-			.key_context("Editor")
-			.track_focus(&self.focus)
-			.on_key_down(cx.listener(Self::key_down))
-			.size_full()
+			.id("titlebar")
+			.h(px(TITLE_H))
+			.flex_none()
 			.flex()
-			.flex_col()
-			.bg(rgb(0x1e1e1e))
-			.text_color(rgb(0xd4d4d4))
-			.font_family(MONO)
-			.text_size(px(FONT_SIZE))
+			.items_center()
+			.relative()
+			.bg(t.c("titleBar.activeBackground", 0x191a1bff))
+			.text_color(fg)
+			.on_mouse_down(MouseButton::Left, |ev, window, _| {
+				if ev.click_count == 2 {
+					window.zoom_window();
+				} else {
+					window.start_window_move();
+				}
+			})
+			// app icon + menu bar (window.titleBarStyle "custom" on Linux/Windows)
 			.child(
 				div()
-					.h(px(30.))
-					.px_3()
+					.w(px(left_w))
+					.h_full()
+					.flex()
+					.flex_none()
+					.overflow_hidden()
+					.child(div().w(px(35.)).h_full().flex().items_center().justify_center().child(img(Path::new(env!("CARGO_MANIFEST_DIR")).join("../resources/linux/code.png")).size(px(16.))))
+					.children(menus.iter().map(|m| div().px(px(8.)).h_full().flex().items_center().child(*m)))
+					.when(overflow, |d| d.child(icon(icons::ELLIPSIS, 16., fg).w(px(30.)).h_full())),
+			)
+			// command center: back/forward + search box
+			.child(
+				div()
+					.flex()
+					.flex_none()
+					.items_center()
+					.mx(px(10.))
+					.child(icon(icons::ARROW_LEFT, 16., fg.opacity(0.5)).w(px(20.)).h(px(22.)))
+					.child(icon(icons::ARROW_RIGHT, 16., fg.opacity(0.5)).w(px(20.)).h(px(22.)))
+					.child(
+						div()
+							.w(px(search_w))
+							.h(px(24.))
+							.mx(px(6.))
+							.pl(px(8.))
+							.flex()
+							.items_center()
+							.rounded(px(6.))
+							.border_1()
+							.border_color(t.c("commandCenter.border", 0x2e3031ff))
+							.bg(t.c("commandCenter.background", 0x191a1bff))
+							.child(title),
+					),
+			)
+			.child(div().flex_1())
+			// layout controls + window controls
+			.child(
+				div()
 					.flex()
 					.items_center()
-					.bg(rgb(0x252526))
-					.text_color(rgb(0xcccccc))
-					.child(format!("{title}{}", if self.dirty { " ●" } else { "" })),
+					.gap(px(4.))
+					.mr(px(4.))
+					.child(action(icons::LAYOUT, fg))
+					.child(action(icons::LAYOUT_SIDEBAR_LEFT, fg))
+					.child(action(icons::LAYOUT_PANEL_OFF, fg))
+					.child(action(icons::LAYOUT_SIDEBAR_RIGHT_OFF, fg)),
 			)
+			.child(
+				div()
+					.flex()
+					.h_full()
+					.child(icon(icons::CHROME_MINIMIZE, 16., fg).w(px(46.)).h_full().id("min").on_click(|_, window, _| window.minimize_window()))
+					.child(
+						icon(if maximized { '\u{eabb}' } else { icons::CHROME_MAXIMIZE }, 16., fg)
+							.w(px(46.))
+							.h_full()
+							.id("max")
+							.on_click(|_, window, _| window.zoom_window()),
+					)
+					.child(
+						icon(icons::CHROME_CLOSE, 16., fg)
+							.w(px(46.))
+							.h_full()
+							.id("close")
+							.hover(|s| s.bg(gpui::rgb(0xe81123)).text_color(gpui::white()))
+							.on_click(cx.listener(|_, _, _, cx| cx.quit())),
+					),
+			)
+	}
+
+	fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
+		let t = &self.theme;
+		let fg = t.c("sideBar.foreground", 0xbfbfbfff);
+		let active_fg = t.c("activityBar.foreground", 0xbfbfbfff);
+		let inactive_fg = t.c("activityBar.inactiveForeground", 0x8c8c8cff);
+		let border = t.c("sideBar.border", 0x2a2b2cff);
+		let activity = |ch: char, active: bool| {
+			icon(ch, 24., if active { active_fg } else { inactive_fg })
+				.size(px(36.))
+				.rounded(px(4.))
+				.when(active, |d| d.bg(t.c("activityBar.activeBackground", 0xffffff1a)))
+		};
+
+		let rows = self.root.as_ref().map(|r| flatten(&self.dir_cache, &self.expanded, r, 0)).unwrap_or_default();
+		let active_path = self.doc().map(|d| d.path.clone());
+		let guide = t.c("tree.indentGuidesStroke", 0x585858ff);
+		let explorer_rows = rows.into_iter().map(|(depth, path, is_dir)| {
+			let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+			let selected = active_path.as_ref() == Some(&path);
+			let lead = if is_dir {
+				icon(if self.expanded.contains(&path) { icons::CHEVRON_DOWN } else { icons::CHEVRON_RIGHT }, 16., fg).w(px(16.)).h(px(ROW_H))
+			} else {
+				self.file_icon(&name, &language_for(&path, &self.languages))
+			};
+			let p = path.clone();
+			div()
+				.id(SharedString::from(path.to_string_lossy().to_string()))
+				.relative()
+				.h(px(ROW_H))
+				.mx(px(4.))
+				.pl(px(11. + depth as f32 * 8.))
+				.flex()
+				.items_center()
+				.gap(px(3.))
+				.rounded(px(4.))
+				.when(selected, |d| d.bg(t.c("list.inactiveSelectionBackground", 0x2c2d2eff)).text_color(t.c("list.activeSelectionForeground", 0xedededff)))
+				.hover(|s| s.bg(t.c("list.hoverBackground", 0xffffff14)))
+				.children((1..=depth).map(|d| div().absolute().top_0().bottom_0().left(px(16. + (d - 1) as f32 * 8.)).w(px(1.)).bg(guide)))
+				.child(lead)
+				.child(name)
+				.on_click(cx.listener(move |wb, _, window, cx| {
+					if is_dir {
+						if !wb.expanded.remove(&p) {
+							wb.dir_cache.entry(p.clone()).or_insert_with(|| read_dir_sorted(&p));
+							wb.expanded.insert(p.clone());
+						}
+						cx.notify();
+					} else {
+						wb.open(p.clone(), cx);
+						window.focus(&wb.focus);
+					}
+				}))
+		});
+
+		let section = |title: &str, open: bool| {
+			div()
+				.h(px(28.))
+				.flex()
+				.items_center()
+				.gap(px(3.))
+				.pl(px(5.))
+				.rounded(px(4.))
+				.text_size(px(12.))
+				.font_weight(FontWeight::SEMIBOLD)
+				.text_color(t.c("sideBarSectionHeader.foreground", 0xbfbfbfff))
+				.child(icon(if open { icons::CHEVRON_DOWN } else { icons::CHEVRON_RIGHT }, 16., fg))
+				.child(title.to_string())
+		};
+		let root_name = self.root.as_ref().and_then(|r| r.file_name()).map(|n| n.to_string_lossy().to_string());
+
+		// floatingPanels.css: the activity bar is its own card (border on all four sides); the side bar
+		// card gives up its left border at the seam.
+		let surface_border = t.colors.get("surface.border").copied().unwrap_or(border);
+		div()
+			.flex()
+			.flex_none()
+			.text_color(fg)
+			.child(
+				// activity bar
+				div()
+					.w(px(ACTIVITY_W))
+					.flex()
+					.flex_col()
+					.items_center()
+					.py(px(4.))
+					.gap(px(8.))
+					.bg(t.c("activityBar.background", 0x191a1bff))
+					.border_1()
+					.border_color(t.colors.get("modernActivityBar.border").copied().unwrap_or(surface_border))
+					.rounded_l(px(8.))
+					.child(activity(icons::FILES, true))
+					.child(activity(icons::SEARCH, false))
+					.child(activity(icons::SOURCE_CONTROL, false))
+					.child(activity(icons::DEBUG_ALT, false))
+					.child(activity(icons::EXTENSIONS, false))
+					.child(div().flex_1())
+					.child(activity(icons::ACCOUNT, false))
+					.child(activity(icons::SETTINGS_GEAR, false)),
+			)
+			.child(
+				// side bar: Explorer
+				div()
+					.w(px(SIDEBAR_W))
+					.flex()
+					.flex_col()
+					.bg(t.c("sideBar.background", 0x191a1bff))
+					.border_t_1()
+					.border_r_1()
+					.border_b_1()
+					.border_color(surface_border)
+					.rounded_r(px(8.))
+					.child(
+						div()
+							.h(px(32.))
+							.pl(px(12.))
+							.pr(px(8.))
+							.flex()
+							.items_center()
+							.justify_between()
+							.text_size(px(12.))
+							.font_weight(FontWeight::SEMIBOLD)
+							.text_color(t.c("sideBarTitle.foreground", 0xbfbfbfff))
+							.child("Explorer")
+							.child(action(icons::ELLIPSIS, fg)),
+					)
+					.children(root_name.map(|n| div().mx(px(4.)).child(section(&n, true))))
+					.child(div().id("explorer").flex_1().flex().flex_col().overflow_y_scroll().children(explorer_rows))
+					.child(div().border_t_1().border_color(border).mx(px(8.)).child(section("Outline", false).h(px(27.))))
+					.child(div().border_t_1().border_color(border).mx(px(8.)).mb(px(5.)).child(section("Timeline", false).h(px(27.)))),
+			)
+	}
+
+	fn render_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+		let ts = window.text_system();
+		if let Ok(adv) = ts.advance(ts.resolve_font(&gpui::font(self.fonts.mono.clone())), px(FONT_SIZE), 'm') {
+			self.char_w = f32::from(adv.width);
+		}
+		let t = &self.theme;
+		let fg = t.c("foreground", 0xbfbfbfff);
+		let icon_fg = t.c("icon.foreground", 0x8c8c8cff);
+		let card = div()
+			.flex_1()
+			.flex()
+			.flex_col()
+			.overflow_hidden()
+			.rounded(px(8.))
+			.border_1()
+			.border_color(t.colors.get("editor.border").or(t.colors.get("surface.border")).copied().unwrap_or_else(|| t.c("widget.border", 0x2a2b2cff)))
+			.bg(t.c("editor.background", 0x121314ff));
+
+		let tabs = self.docs.iter().enumerate().map(|(i, d)| {
+			let active = Some(i) == self.active;
+			let name = d.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+			// modernUI tabs: 6px left inset, 22px icon box, 24px actions box, 8px between tabs.
+			let tab_fg = if active { t.c("list.activeSelectionForeground", 0xedededff) } else { t.c("tab.inactiveForeground", 0x8c8c8cff) };
+			div()
+				.id(("tab", i))
+				.h(px(TABS_H - 1.))
+				.pl(px(6.))
+				.pr(px(5.))
+				.mr(px(8.))
+				.flex()
+				.items_center()
+				.rounded(px(4.))
+				.when(active, |d| d.bg(t.c("tab.activeBackground", 0x121314ff)))
+				.text_color(tab_fg)
+				.child(self.file_icon(&name, &d.lang).pr(px(6.)).w(px(22.)))
+				.child(name)
+				.child(
+					div().ml(px(2.)).w(px(24.)).flex().justify_center().child(
+						icon(if d.dirty { icons::CIRCLE_FILLED } else { icons::CLOSE }, 16., tab_fg)
+							.size(px(20.))
+							.rounded(px(4.))
+							.id(("close", i))
+							.on_click(cx.listener(move |wb, _, _, cx| wb.close(i, cx))),
+					),
+				)
+				.on_click(cx.listener(move |wb, _, window, cx| {
+					wb.active = Some(i);
+					wb.popup = None;
+					window.focus(&wb.focus);
+					cx.notify();
+				}))
+		});
+		let header = div()
+			.h(px(TABS_H))
+			.flex_none()
+			.flex()
+			.items_start()
+			// modernUI connected tabs: strip color over the editor background (connectedEditorTabs.ts)
+			.bg(t.c("editor.background", 0x121314ff).blend(t.colors.get("editorGroupHeader.connectedTabsBackground").copied().unwrap_or_else(|| t.c("editorGroupHeader.tabsBackground", 0x191a1bff))))
+			.border_b_1()
+			.border_color(t.c("editorGroupHeader.tabsBorder", 0x2a2b2cff))
+			.child(div().flex_1().flex().h_full().children(tabs))
+			.when(self.doc().is_some(), |d| {
+				d.child(div().h_full().flex().items_center().gap(px(4.)).px(px(4.)).child(action(icons::SPLIT_HORIZONTAL, icon_fg)).child(action(icons::ELLIPSIS, icon_fg)))
+			});
+
+		let Some(doc) = self.doc() else {
+			return card.child(header);
+		};
+
+		// breadcrumbs: folders relative to the workspace, then the file
+		let rel = self.root.as_ref().and_then(|r| doc.path.strip_prefix(r).ok()).unwrap_or(&doc.path).to_path_buf();
+		let parts: Vec<String> = rel.iter().map(|p| p.to_string_lossy().to_string()).collect();
+		let crumb_fg = t.c("breadcrumb.foreground", 0x8c8c8cff);
+		let crumbs = parts.iter().enumerate().flat_map(|(i, p)| {
+			let last = i + 1 == parts.len();
+			let mut v = Vec::new();
+			if i > 0 {
+				v.push(icon(icons::CHEVRON_RIGHT, 16., crumb_fg));
+			}
+			v.push(div().flex().items_center().gap(px(3.)).when(last, |d| d.child(self.file_icon(p, &doc.lang).h(px(BREADCRUMBS_H)))).child(p.clone()));
+			v
+		});
+
+		let (cl, cc) = doc.buf.cursor;
+		let items = self.visible_items();
+		let selected = self.popup.as_ref().map_or(0, |p| p.selected.min(items.len().saturating_sub(1)));
+		let scroll_y = f32::from(doc.scroll.0.borrow().base_handle.offset().y);
+		let line_fg = t.c("editorLineNumber.foreground", 0x858889ff);
+		let line_active = t.c("editorLineNumber.activeForeground", 0xbbbebfff);
+		let line_hl = t.c("editor.lineHighlightBackground", 0x242526ff);
+		let cursor_c = t.c("editorCursor.foreground", 0xbbbebfff);
+		let minimap_fg = t.c("editor.foreground", 0xbbbebfff).opacity(0.35);
+		// shortcut: minimap draws one bar per line (no per-token colors), first 400 lines.
+		let minimap: Vec<(f32, f32)> = doc
+			.buf
+			.lines
+			.iter()
+			.take(400)
+			.map(|l| ((l.len() - l.trim_start().len()) as f32, l.trim().chars().count() as f32))
+			.collect();
+
+		card.child(header)
+			.child(div().h(px(BREADCRUMBS_H)).flex_none().pl(px(16.)).flex().items_center().text_color(crumb_fg).children(crumbs))
 			.child(
 				div()
 					.flex_1()
 					.relative()
 					.overflow_hidden()
+					.font_family(self.fonts.mono.clone())
+					.text_size(px(FONT_SIZE))
+					.line_height(px(LINE_H))
+					.text_color(t.c("editor.foreground", 0xbbbebfff))
 					.child(
 						uniform_list(
 							"lines",
-							self.buf.lines.len(),
-							cx.processor(move |ed, range: std::ops::Range<usize>, _window, cx| {
+							doc.buf.lines.len(),
+							cx.processor(move |wb, range: std::ops::Range<usize>, _window, cx| {
+								let Some(doc) = wb.doc() else { return Vec::new() };
 								range
 									.map(|ix| {
-										let text = ed.buf.lines[ix].replace('\t', "    ");
+										let text = doc.buf.lines[ix].replace('\t', "    ");
 										let content = if ix == cl {
 											let at = text.char_indices().nth(cc).map_or(text.len(), |(i, _)| i);
 											div()
 												.flex()
+												.flex_1()
+												.h_full()
+												.bg(line_hl)
 												.child(text[..at].to_string())
-												.child(div().w(px(2.)).h(px(LINE_H)).bg(rgb(0xaeafad)))
+												.child(div().w(px(2.)).h_full().bg(cursor_c))
 												.child(text[at..].to_string())
 										} else {
-											div().child(text)
+											div().flex_1().child(text)
 										};
 										div()
 											.id(ix)
 											.flex()
+											.w_full()
 											.h(px(LINE_H))
 											.whitespace_nowrap()
-											.when(ix == cl, |d| d.bg(rgb(0x2a2d2e)))
-											.on_mouse_down(MouseButton::Left, cx.listener(move |ed, ev, _, cx| ed.click_line(ix, ev, cx)))
-											.child(div().w(px(GUTTER - 12.)).mr(px(12.)).flex().justify_end().text_color(rgb(0x858585)).child((ix + 1).to_string()))
+											.on_mouse_down(
+												MouseButton::Left,
+												cx.listener(move |wb, ev, window, cx| {
+													window.focus(&wb.focus);
+													wb.click_line(ix, ev, cx)
+												}),
+											)
+											.child(
+												div()
+													.w(px(GUTTER))
+													.flex_none()
+													.pr(px(GUTTER - LINE_NUMBER_RIGHT))
+													.flex()
+													.justify_end()
+													.text_color(if ix == cl { line_active } else { line_fg })
+													.child((ix + 1).to_string()),
+											)
 											.child(content)
+											.child(div().w(px(MINIMAP_W + SCROLLBAR_W)).flex_none())
 									})
 									.collect()
 							}),
 						)
-						.track_scroll(self.scroll.clone())
+						.track_scroll(doc.scroll.clone())
 						.size_full(),
+					)
+					.child(div().absolute().top_0().bottom_0().right(px(SCROLLBAR_W - 1.)).w(px(1.)).bg(t.c("editorOverviewRuler.border", 0x2a2b2cff).opacity(0.5)))
+					// minimap: 1px per character, 2px per line (scale 1)
+					.child(
+						div().absolute().top_0().right(px(SCROLLBAR_W)).w(px(MINIMAP_W)).h_full().children(
+							minimap
+								.into_iter()
+								.enumerate()
+								.filter(|(_, (_, w))| *w > 0.)
+								.map(|(i, (x, w))| div().absolute().top(px(i as f32 * 2.)).left(px(x)).w(px(w.min(MINIMAP_W - x))).h(px(2.)).bg(minimap_fg)),
+						),
 					)
 					.when(!items.is_empty(), |d| {
 						d.child(
@@ -531,51 +1123,97 @@ impl Render for Editor {
 								.top(px((cl + 1) as f32 * LINE_H + scroll_y))
 								.left(px(GUTTER + cc as f32 * self.char_w))
 								.min_w(px(240.))
-								.bg(rgb(0x252526))
+								.rounded(px(4.))
+								.bg(t.c("editorSuggestWidget.background", 0x202122ff))
 								.border_1()
-								.border_color(rgb(0x454545))
+								.border_color(t.c("editorSuggestWidget.border", 0x2a2b2cff))
+								.text_color(t.c("editorSuggestWidget.foreground", 0xbfbfbfff))
 								.children(items.iter().enumerate().map(|(i, (label, _))| {
-									div().px_2().h(px(LINE_H)).when(i == selected, |d| d.bg(rgb(0x04395e))).child(label.clone())
+									div()
+										.px(px(6.))
+										.h(px(LINE_H))
+										.when(i == selected, |d| d.bg(t.c("editorSuggestWidget.selectedBackground", 0xffffff26)))
+										.child(label.clone())
 								})),
 						)
 					}),
 			)
-			.child(
-				div()
-					.h(px(22.))
-					.px_3()
-					.flex()
-					.items_center()
-					.justify_between()
-					.bg(rgb(0x007acc))
-					.text_color(rgb(0xffffff))
-					.text_size(px(12.))
-					.child(self.status.clone())
-					.child(format!("Ln {}, Col {}", cl + 1, cc + 1)),
-			)
+	}
+
+	fn render_statusbar(&self) -> Div {
+		let t = &self.theme;
+		let fg = t.c("statusBar.foreground", 0x8c8c8cff);
+		let item = || div().h(px(24.)).px(px(5.)).mx(px(3.)).flex().items_center().gap(px(4.)).rounded(px(4.));
+		let mut right = Vec::new();
+		if let Some(doc) = self.doc() {
+			let (l, c) = doc.buf.cursor;
+			let lang = self.languages.iter().find(|x| x.id == doc.lang).map_or("Plain Text".to_string(), |x| x.name.clone());
+			right.push(item().child(format!("Ln {}, Col {}", l + 1, c + 1)));
+			right.push(item().child(indentation_label(&doc.buf.lines)));
+			right.push(item().child("UTF-8"));
+			right.push(item().child(if doc.crlf { "CRLF" } else { "LF" }));
+			right.push(item().child(icon(icons::BRACKET, 14., fg)).child(lang));
+		}
+		right.push(item().child(icon(icons::BELL, 16., fg)));
+		div()
+			.h(px(STATUS_H))
+			.flex_none()
+			.flex()
+			.items_center()
+			.px(px(9.))
+			.bg(t.c("statusBar.background", 0x191a1bff))
+			.text_color(fg)
+			.text_size(px(12.))
+			.child(item().w(px(28.)).justify_center().child(icon(icons::REMOTE, 16., fg)))
+			.child(item().child(icon(icons::ERROR, 14., fg)).child("0").child(icon(icons::WARNING, 14., fg)).child("0"))
+			.child(div().flex_1())
+			.children(right)
+	}
+}
+
+impl Render for Workbench {
+	fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+		let titlebar = self.render_titlebar(window, cx);
+		let sidebar = self.render_sidebar(cx);
+		let editor = self.render_editor(window, cx);
+		let status = self.render_statusbar();
+		div()
+			.key_context("Workbench")
+			.track_focus(&self.focus)
+			.on_key_down(cx.listener(Self::key_down))
+			.size_full()
+			.flex()
+			.flex_col()
+			.bg(self.theme.c("titleBar.activeBackground", 0x191a1bff))
+			.text_color(self.theme.c("foreground", 0xbfbfbfff))
+			.font_family(self.fonts.ui.clone())
+			.text_size(px(UI_SIZE))
+			.child(titlebar)
+			.child(div().flex_1().flex().gap(px(GAP)).px(px(GAP)).pb(px(GAP)).overflow_hidden().child(sidebar).child(editor))
+			.child(status)
 	}
 }
 
 fn main() {
-	let path = std::env::args_os().nth(1).map(PathBuf::from);
+	let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
 	Application::new().run(move |cx: &mut App| {
-		let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
-		let title = path.as_ref().and_then(|p| p.file_name()).map_or("Untitled-1".into(), |n| n.to_string_lossy().to_string());
-		let window = cx
-			.open_window(
-				WindowOptions {
-					window_bounds: Some(WindowBounds::Windowed(bounds)),
-					titlebar: Some(gpui::TitlebarOptions { title: Some(title.into()), ..Default::default() }),
-					..Default::default()
-				},
-				|window, cx| {
-					let editor = cx.new(|cx| Editor::new(path.clone(), cx));
-					window.focus(&editor.read(cx).focus.clone());
-					editor
-				},
-			)
-			.expect("open window");
-		let _ = window;
+		cx.text_system().add_fonts(vec![Cow::Borrowed(icons::CODICON_TTF), Cow::Borrowed(icons::SETI_TTF)]).expect("load icon fonts");
+		let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+		cx.open_window(
+			WindowOptions {
+				window_bounds: Some(WindowBounds::Windowed(bounds)),
+				titlebar: None,
+				window_decorations: Some(if std::env::var_os("CODE_NATIVE_SERVER_DECORATIONS").is_some() { WindowDecorations::Server } else { WindowDecorations::Client }),
+				app_id: Some("code-oss".into()),
+				..Default::default()
+			},
+			|window, cx| {
+				let wb = cx.new(|cx| Workbench::new(args.clone(), cx));
+				window.focus(&wb.read(cx).focus.clone());
+				wb
+			},
+		)
+		.expect("open window");
 		cx.on_window_closed(|cx| cx.quit()).detach();
 		cx.activate(true);
 	});
@@ -597,15 +1235,34 @@ mod tests {
 
 	#[test]
 	fn language_from_contributions() {
-		let exts = [json!({ "contributes": { "languages": [{ "id": "rust", "extensions": [".rs"] }, { "id": "dockerfile", "filenames": ["Dockerfile"] }] } })];
-		assert_eq!(language_for(Some(Path::new("/x/main.RS")), &exts), "rust");
-		assert_eq!(language_for(Some(Path::new("Dockerfile")), &exts), "dockerfile");
-		assert_eq!(language_for(None, &exts), "plaintext");
+		let langs = languages_of(&[json!({ "contributes": { "languages": [
+			{ "id": "rust", "aliases": ["Rust"], "extensions": [".rs"] },
+			{ "id": "dockerfile", "filenames": ["Dockerfile"] },
+			{ "id": "typescript", "extensions": [".ts"] }, { "id": "dts", "extensions": [".d.ts"] },
+		] } })]);
+		assert_eq!(language_for(Path::new("/x/main.RS"), &langs), "rust");
+		assert_eq!(language_for(Path::new("Dockerfile"), &langs), "dockerfile");
+		assert_eq!(language_for(Path::new("a.d.ts"), &langs), "dts");
+		assert_eq!(language_for(Path::new("a.txt"), &langs), "plaintext");
+		assert_eq!(langs[0].name, "Rust");
 	}
 
 	#[test]
 	fn completion_item_dto() {
 		assert_eq!(completion_item(&json!({ "a": "foo" })), Some(("foo".into(), "foo".into(), "foo".into())));
 		assert_eq!(completion_item(&json!({ "a": { "label": "bar" }, "h": "bar(${1})", "i": 4, "e": "1" })), Some(("bar".into(), "bar()".into(), "1".into())));
+	}
+
+	#[test]
+	fn indentation_and_sorting() {
+		assert_eq!(indentation_label(&["fn x() {".into(), "    a".into(), "        b".into()]), "Spaces: 4");
+		assert_eq!(indentation_label(&["\ta".into()]), "Tab Size: 4");
+		let dir = std::env::temp_dir().join(format!("code-native-sort-{}", std::process::id()));
+		std::fs::create_dir_all(dir.join("src")).unwrap();
+		std::fs::create_dir_all(dir.join(".git")).unwrap();
+		std::fs::write(dir.join("B.toml"), "").unwrap();
+		std::fs::write(dir.join("a.rs"), "").unwrap();
+		assert_eq!(read_dir_sorted(&dir), [("src".into(), true), ("a.rs".into(), false), ("B.toml".into(), false)]);
+		std::fs::remove_dir_all(dir).unwrap();
 	}
 }
