@@ -204,6 +204,40 @@ pub struct Options {
 	pub extensions: Vec<PathBuf>,
 	/// Where global/workspace storage and logs go.
 	pub data_dir: PathBuf,
+	/// Default settings (nested object, e.g. `{"css": {"lint": {...}}}`) and their dotted keys,
+	/// normally collected from the extensions' `contributes.configuration`.
+	pub configuration_defaults: (Value, Vec<String>),
+}
+
+/// Nested defaults + keys from `contributes.configuration` (object or array form) of packages.
+pub fn configuration_defaults<'a>(packages: impl IntoIterator<Item = &'a Value>) -> (Value, Vec<String>) {
+	let mut root = serde_json::Map::new();
+	let mut keys = Vec::new();
+	for pkg in packages {
+		let sections = match &pkg["contributes"]["configuration"] {
+			Value::Array(a) => a.clone(),
+			v @ Value::Object(_) => vec![v.clone()],
+			_ => continue,
+		};
+		for (key, prop) in sections.iter().flat_map(|s| s["properties"].as_object().cloned().unwrap_or_default()) {
+			let Some(default) = prop.get("default") else { continue };
+			if key.starts_with('[') {
+				continue; // language overrides
+			}
+			let mut node = &mut root;
+			let parts: Vec<&str> = key.split('.').collect();
+			for part in &parts[..parts.len() - 1] {
+				let entry = node.entry(part.to_string()).or_insert_with(|| json!({}));
+				if !entry.is_object() {
+					*entry = json!({});
+				}
+				node = entry.as_object_mut().unwrap();
+			}
+			node.insert(parts[parts.len() - 1].to_string(), default.clone());
+			keys.push(key);
+		}
+	}
+	(Value::Object(root), keys)
 }
 
 struct Writer {
@@ -339,8 +373,10 @@ impl ExtHost {
 
 		// What the workbench's MainThread* services send right after connecting; activation waits on these.
 		let m = empty_config_model();
+		let (contents, keys) = &opts.configuration_defaults;
+		let defaults = json!({ "contents": contents, "keys": keys, "overrides": [] });
 		host.notify("ExtHostConfiguration", "$initializeConfiguration", vec![json!({
-			"defaults": m, "policy": m, "application": m, "userLocal": m, "userRemote": m, "workspace": m,
+			"defaults": defaults, "policy": m, "application": m, "userLocal": m, "userRemote": m, "workspace": m,
 			"folders": [], "configurationScopes": [],
 		})])?;
 		host.notify("ExtHostWorkspace", "$initializeWorkspace", vec![Value::Null, json!(true)])?;
@@ -467,6 +503,19 @@ mod tests {
 		push_long(&mut b, b"\"x\"");
 		b.push(4);
 		assert_eq!(decode(&b).unwrap(), Message::Request { req: 9, rpc_id: 10, method: "$foo".into(), args: vec![json!("x"), Value::Null] });
+	}
+
+	#[test]
+	fn configuration_defaults_nest() {
+		let pkg = json!({ "contributes": { "configuration": [{ "properties": {
+			"css.lint.emptyRules": { "default": "warning" },
+			"css.validate": { "default": true },
+			"[css]": { "default": {} },
+			"noDefault": { "type": "string" },
+		} }] } });
+		let (v, keys) = configuration_defaults([&pkg]);
+		assert_eq!(v, json!({ "css": { "lint": { "emptyRules": "warning" }, "validate": true } }));
+		assert_eq!(keys, ["css.lint.emptyRules", "css.validate"]);
 	}
 
 	#[test]

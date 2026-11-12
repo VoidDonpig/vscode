@@ -62,6 +62,60 @@ enum HostEvent {
 	Ready(Arc<ExtHost>),
 	Failed(String),
 	CompletionProvider { handle: Value, selector: Value, triggers: Vec<String> },
+	/// `MainThreadDiagnostics.$changeMany`: (file path, markers) per resource.
+	Diagnostics { owner: String, entries: Vec<(String, Vec<Marker>)> },
+	ClearDiagnostics(String),
+	/// `MainThreadMessageService.$showMessage` (severity: 1 info, 2 warning, 3 error)
+	Message(u64, String),
+}
+
+/// IMarkerData: 1-based lines, 1-based UTF-16 columns; severity 1 hint, 2 info, 4 warning, 8 error.
+#[derive(Clone, Debug, PartialEq)]
+struct Marker {
+	severity: u64,
+	message: String,
+	source: Option<String>,
+	start: (usize, usize),
+	end: (usize, usize),
+}
+
+fn parse_marker(m: &Value) -> Option<Marker> {
+	let n = |k: &str| m[k].as_u64().map(|v| v as usize);
+	Some(Marker {
+		severity: m["severity"].as_u64()?,
+		message: m["message"].as_str()?.to_string(),
+		source: m["source"].as_str().map(String::from),
+		start: (n("startLineNumber")?, n("startColumn")?),
+		end: (n("endLineNumber")?, n("endColumn")?),
+	})
+}
+
+/// Byte offset of a 1-based UTF-16 column in `line` (clamped).
+fn utf16_col_to_byte(line: &str, col: usize) -> usize {
+	let mut units = 0;
+	for (b, c) in line.char_indices() {
+		if units + 1 >= col {
+			return b;
+		}
+		units += c.len_utf16();
+	}
+	line.len()
+}
+
+/// Byte ranges of `line` (0-based index) covered by markers, with their severity.
+fn marker_ranges(markers: &[&Marker], ix: usize, line: &str) -> Vec<(Range<usize>, u64)> {
+	markers
+		.iter()
+		.filter(|m| m.start.0 <= ix + 1 && ix + 1 <= m.end.0 && m.severity >= 2)
+		.map(|m| {
+			let s = if m.start.0 == ix + 1 { utf16_col_to_byte(line, m.start.1) } else { 0 };
+			let e = if m.end.0 == ix + 1 { utf16_col_to_byte(line, m.end.1) } else { line.len() };
+			// Empty ranges still get a squiggle under the next character, like the editor.
+			let e = if e <= s { (s + line[s..].chars().next().map_or(0, char::len_utf8)).min(line.len()) } else { e };
+			(s..e, m.severity)
+		})
+		.filter(|(r, _)| r.start < r.end)
+		.collect()
 }
 
 struct Provider {
@@ -132,6 +186,15 @@ struct Workbench {
 	popup: Option<Popup>,
 	char_w: f32,
 	quick: Option<Quick>,
+	/// owner -> file path -> markers
+	markers: HashMap<String, HashMap<String, Vec<Marker>>>,
+	/// (id, severity, message)
+	notifications: Vec<(u64, u64, String)>,
+	next_notification: u64,
+	/// Hovered diagnostic: (line, x in px within the text area, text).
+	hover: Option<(usize, f32, String)>,
+	/// Id of the text editor the extension host knows as visible/active (one editor group).
+	editor_id: Option<String>,
 	ext_commands: Vec<quickinput::ExtensionCommand>,
 	sidebar_visible: bool,
 }
@@ -412,13 +475,34 @@ fn send_open(host: &ExtHost, doc: &Doc) {
 	})]);
 }
 
-fn start_host(app_root: PathBuf, extensions: Vec<PathBuf>, tx: UnboundedSender<HostEvent>) {
+fn start_host(app_root: PathBuf, extensions: Vec<PathBuf>, configuration_defaults: (Value, Vec<String>), tx: UnboundedSender<HostEvent>) {
 	std::thread::spawn(move || {
 		let events = tx.clone();
 		let handler = Box::new(move |proxy: &str, method: &str, args: &[Value]| {
 			if (proxy, method) == ("MainThreadLanguageFeatures", "$registerCompletionsProvider") {
 				let triggers = args[2].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(String::from)).collect();
 				let _ = events.unbounded_send(HostEvent::CompletionProvider { handle: args[0].clone(), selector: args[1].clone(), triggers });
+			}
+			match (proxy, method) {
+				("MainThreadDiagnostics", "$changeMany") => {
+					let entries = args[1]
+						.as_array()
+						.into_iter()
+						.flatten()
+						.filter_map(|e| {
+							let path = e[0]["path"].as_str()?.to_string();
+							Some((path, e[1].as_array().into_iter().flatten().filter_map(parse_marker).collect()))
+						})
+						.collect();
+					let _ = events.unbounded_send(HostEvent::Diagnostics { owner: args[0].as_str().unwrap_or_default().to_string(), entries });
+				}
+				("MainThreadDiagnostics", "$clear") => {
+					let _ = events.unbounded_send(HostEvent::ClearDiagnostics(args[0].as_str().unwrap_or_default().to_string()));
+				}
+				("MainThreadMessageService", "$showMessage") => {
+					let _ = events.unbounded_send(HostEvent::Message(args[0].as_u64().unwrap_or(1), args[1].as_str().unwrap_or_default().to_string()));
+				}
+				_ => {}
 			}
 			Ok(None)
 		});
@@ -427,6 +511,7 @@ fn start_host(app_root: PathBuf, extensions: Vec<PathBuf>, tx: UnboundedSender<H
 			app_root,
 			extensions,
 			data_dir: std::env::temp_dir().join("code-native"),
+			configuration_defaults,
 		};
 		let _ = tx.unbounded_send(match ExtHost::start(opts, handler) {
 			Ok(h) => HostEvent::Ready(Arc::new(h)),
@@ -450,7 +535,7 @@ impl Workbench {
 		let root = args.iter().find(|a| a.is_dir()).cloned().or_else(|| files.first().and_then(|f| f.parent()).map(Path::to_path_buf));
 
 		let (tx, mut rx) = unbounded();
-		start_host(app_root.clone(), ext_dirs, tx);
+		start_host(app_root.clone(), ext_dirs, code_exthost::configuration_defaults(&packages), tx);
 		cx.spawn(async move |this, cx| {
 			while let Some(ev) = rx.next().await {
 				if this.update(cx, |wb, cx| wb.on_host_event(ev, cx)).is_err() {
@@ -479,6 +564,11 @@ impl Workbench {
 			popup: None,
 			char_w: FONT_SIZE * 0.6,
 			quick: None,
+			markers: HashMap::new(),
+			notifications: Vec::new(),
+			next_notification: 0,
+			hover: None,
+			editor_id: None,
 			ext_commands,
 			sidebar_visible: true,
 		};
@@ -486,6 +576,35 @@ impl Workbench {
 			wb.open(f, cx);
 		}
 		wb
+	}
+
+	/// Tells the extension host which document is shown in the (single) visible editor, so
+	/// `window.activeTextEditor` / `visibleTextEditors` and pull diagnostics work.
+	fn sync_editor(&mut self) {
+		let Some(host) = self.host.clone() else { return };
+		let want = self.doc().map(|d| (format!("editor:{}", d.path.display()), d.uri.clone(), d.buf.cursor, d.buf.lines.len(), indentation_label(&d.buf.lines)));
+		if want.as_ref().map(|w| &w.0) == self.editor_id.as_ref() {
+			return;
+		}
+		let mut delta = serde_json::Map::new();
+		if let Some(old) = self.editor_id.take() {
+			delta.insert("removedEditors".into(), json!([old]));
+		}
+		if let Some((id, uri, (l, c), n, indent)) = want {
+			let tab_size = indent.rsplit(' ').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(4);
+			delta.insert("addedEditors".into(), json!([{
+				"id": id, "documentUri": uri,
+				"options": { "tabSize": tab_size, "indentSize": tab_size, "originalIndentSize": tab_size, "insertSpaces": !indent.starts_with("Tab"), "cursorStyle": 1, "lineNumbers": 1 },
+				"selections": [{ "selectionStartLineNumber": l + 1, "selectionStartColumn": c + 1, "positionLineNumber": l + 1, "positionColumn": c + 1 }],
+				"visibleRanges": [{ "startLineNumber": 1, "startColumn": 1, "endLineNumber": n, "endColumn": 1 }],
+				"editorPosition": 0,
+			}]));
+			delta.insert("newActiveEditor".into(), json!(id));
+			self.editor_id = Some(id);
+		} else {
+			delta.insert("newActiveEditor".into(), Value::Null);
+		}
+		let _ = host.notify("ExtHostDocumentsAndEditors", "$acceptDocumentsAndEditorsDelta", vec![Value::Object(delta)]);
 	}
 
 	fn doc(&self) -> Option<&Doc> {
@@ -532,10 +651,16 @@ impl Workbench {
 			self.expanded.extend(dirs);
 		}
 		self.popup = None;
+		self.sync_editor();
 		cx.notify();
 	}
 
 	fn close(&mut self, i: usize, cx: &mut Context<Self>) {
+		if Some(i) == self.active {
+			self.active = None;
+			self.sync_editor();
+			self.active = Some(i);
+		}
 		let doc = self.docs.remove(i);
 		if let Some(host) = &self.host {
 			let _ = host.notify("ExtHostDocumentsAndEditors", "$acceptDocumentsAndEditorsDelta", vec![json!({ "removedDocuments": [doc.uri] })]);
@@ -546,6 +671,7 @@ impl Workbench {
 			a => a,
 		};
 		self.popup = None;
+		self.sync_editor();
 		cx.notify();
 	}
 
@@ -567,9 +693,36 @@ impl Workbench {
 				})
 				.detach();
 				self.host = Some(host);
+				self.editor_id = None;
+				self.sync_editor();
 			}
 			HostEvent::Failed(e) => eprintln!("code-native: extension host failed: {e}"),
 			HostEvent::CompletionProvider { handle, selector, triggers } => self.providers.push(Provider { handle, selector, triggers }),
+			HostEvent::Diagnostics { owner, entries } => {
+				let by_file = self.markers.entry(owner).or_default();
+				for (path, markers) in entries {
+					by_file.insert(path, markers);
+				}
+			}
+			HostEvent::ClearDiagnostics(owner) => {
+				self.markers.remove(&owner);
+			}
+			HostEvent::Message(severity, text) => {
+				let id = self.next_notification;
+				self.next_notification += 1;
+				self.notifications.push((id, severity, text));
+				// Info and warning toasts hide after a while; errors stay until closed.
+				if severity < 3 {
+					cx.spawn(async move |this, cx| {
+						cx.background_executor().timer(std::time::Duration::from_secs(10)).await;
+						let _ = this.update(cx, |wb, cx| {
+							wb.notifications.retain(|n| n.0 != id);
+							cx.notify();
+						});
+					})
+					.detach();
+				}
+			}
 		}
 		cx.notify();
 	}
@@ -1053,8 +1206,30 @@ impl Workbench {
 		cx.notify();
 	}
 
+	/// Markers of the active document (all owners).
+	fn doc_markers(&self) -> Vec<&Marker> {
+		let Some(doc) = self.doc() else { return Vec::new() };
+		let path = doc.path.to_string_lossy();
+		self.markers.values().filter_map(|m| m.get(path.as_ref())).flatten().collect()
+	}
+
 	fn drag_line(&mut self, line: usize, ev: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
 		if ev.pressed_button != Some(MouseButton::Left) {
+			// Hover: show the diagnostic message under the mouse.
+			let (l, col) = self.column_at(line, f32::from(ev.position.x));
+			let hover = self.doc().and_then(|doc| {
+				let text = &doc.buf.lines[l];
+				let byte = text.char_indices().nth(col).map_or(text.len(), |(b, _)| b);
+				let markers = self.doc_markers();
+				let hit = marker_ranges(&markers, l, text).iter().position(|(r, _)| r.contains(&byte))?;
+				let m = markers.iter().filter(|m| m.start.0 <= l + 1 && l + 1 <= m.end.0 && m.severity >= 2).nth(hit)?;
+				let x = text[..byte.min(text.len())].chars().count() as f32 * self.char_w;
+				Some((l, x, format!("{}{}", m.message, m.source.as_ref().map(|s| format!("  {s}")).unwrap_or_default())))
+			});
+			if hover != self.hover {
+				self.hover = hover;
+				cx.notify();
+			}
 			return;
 		}
 		let pos = self.column_at(line, f32::from(ev.position.x));
@@ -1386,6 +1561,7 @@ impl Workbench {
 				)
 				.on_click(cx.listener(move |wb, _, window, cx| {
 					wb.active = Some(i);
+					wb.sync_editor();
 					wb.popup = None;
 					window.focus(&wb.focus);
 					cx.notify();
@@ -1433,6 +1609,9 @@ impl Workbench {
 		let line_dimmed = t.colors.get("editorLineNumber.dimmedForeground").copied().unwrap_or(line_fg.opacity(0.4));
 		let indent_guide = t.c("editorIndentGuide.background1", 0x404040ff);
 		let selection_bg = t.c("editor.selectionBackground", 0x264f78ff);
+		let squiggle_error = t.c("editorError.foreground", 0xf14c4cff);
+		let squiggle_warning = t.c("editorWarning.foreground", 0xcca700ff);
+		let squiggle_info = t.c("editorInfo.foreground", 0x3794ffff);
 		let cursor_c = t.c("editorCursor.foreground", 0xbbbebfff);
 		let editor_fg = t.c("editor.foreground", 0xbbbebfff);
 		// Minimap (scale 1): each character is a 1x2px block in its token color.
@@ -1486,6 +1665,7 @@ impl Workbench {
 									prev.min(next)
 								};
 								let selection = doc.buf.selection();
+								let markers = wb.doc_markers();
 								let display_col = |line: &str, chars: usize| -> f32 { line.chars().take(chars).map(|c| if c == '\t' { 4. } else { 1. }).sum::<f32>() * char_w };
 								// editor.renderFinalNewline "dimmed": the empty last line's number at 40%.
 								let final_empty = lines.len() > 1 && lines.last().is_some_and(|l| l.is_empty());
@@ -1493,22 +1673,40 @@ impl Workbench {
 									.map(|ix| {
 										let line = &doc.buf.lines[ix];
 										let (text, map) = expand_tabs(line);
-										let highlights: Vec<(Range<usize>, HighlightStyle)> = doc
-											.tokens
-											.get(ix)
-											.into_iter()
-											.flat_map(|t| &t.runs)
-											.map(|(r, st)| {
-												let style = HighlightStyle {
-													color: st.foreground,
-													font_weight: st.bold.then_some(FontWeight::BOLD),
-													font_style: st.italic.then_some(FontStyle::Italic),
-													underline: st.underline.then(|| UnderlineStyle { thickness: px(1.), ..Default::default() }),
-													..Default::default()
-												};
-												(map[r.start]..map[r.end], style)
-											})
-											.collect();
+										// Token styles per byte, then diagnostics squiggles on top; merged into runs.
+										let mut per_byte: Vec<(TokenStyle, Option<Hsla>)> = vec![(TokenStyle::default(), None); line.len()];
+										for (r, st) in doc.tokens.get(ix).into_iter().flat_map(|t| &t.runs) {
+											per_byte[r.clone()].iter_mut().for_each(|b| b.0 = *st);
+										}
+										for (r, sev) in marker_ranges(&markers, ix, line) {
+											let c = match sev {
+												8 => squiggle_error,
+												4 => squiggle_warning,
+												_ => squiggle_info,
+											};
+											per_byte[r].iter_mut().for_each(|b| b.1 = Some(c));
+										}
+										let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+										let mut start = 0;
+										for b in 1..=per_byte.len() {
+											if b == per_byte.len() || per_byte[b] != per_byte[start] {
+												let (st, squiggle) = per_byte[start];
+												let underline = squiggle
+													.map(|color| UnderlineStyle { thickness: px(1.), color: Some(color), wavy: true })
+													.or_else(|| st.underline.then(|| UnderlineStyle { thickness: px(1.), ..Default::default() }));
+												highlights.push((
+													map[start]..map[b],
+													HighlightStyle {
+														color: st.foreground,
+														font_weight: st.bold.then_some(FontWeight::BOLD),
+														font_style: st.italic.then_some(FontStyle::Italic),
+														underline,
+														..Default::default()
+													},
+												));
+												start = b;
+											}
+										}
 										let styled = StyledText::new(text).with_highlights(highlights);
 										// shortcut: indent guides are all drawn inactive (no active-block highlight).
 										let guides = (0..level(ix)).map(|k| div().absolute().top_0().bottom_0().left(px((k * 4) as f32 * char_w)).w(px(1.)).bg(indent_guide));
@@ -1578,6 +1776,23 @@ impl Workbench {
 								.map(|(_, (y, x, w, c))| div().absolute().top(px(y)).left(px(x)).w(px(w.min(MINIMAP_W - x))).h(px(2.)).bg(c)),
 						),
 					)
+					.children(self.hover.as_ref().map(|(line, x, text)| {
+						div()
+							.absolute()
+							.top(px((*line + 1) as f32 * LINE_H + scroll_y))
+							.left(px(GUTTER + x))
+							.max_w(px(500.))
+							.px(px(8.))
+							.py(px(4.))
+							.rounded(px(4.))
+							.font_family(self.fonts.ui.clone())
+							.text_size(px(UI_SIZE))
+							.bg(t.c("editorHoverWidget.background", 0x202122ff))
+							.border_1()
+							.border_color(t.c("editorHoverWidget.border", 0x2a2b2cff))
+							.text_color(t.c("editorHoverWidget.foreground", 0xbfbfbfff))
+							.child(text.clone())
+					}))
 					.when(!items.is_empty(), |d| {
 						d.child(
 							div()
@@ -1627,7 +1842,10 @@ impl Workbench {
 			.text_color(fg)
 			.text_size(px(12.))
 			.child(item().w(px(28.)).justify_center().child(icon(icons::REMOTE, 16., fg)))
-			.child(item().child(icon(icons::ERROR, 14., fg)).child("0").child(icon(icons::WARNING, 14., fg)).child("0"))
+			.child({
+				let count = |sev: u64| self.markers.values().flat_map(|f| f.values()).flatten().filter(|m| m.severity == sev).count().to_string();
+				item().child(icon(icons::ERROR, 14., fg)).child(count(8)).child(icon(icons::WARNING, 14., fg)).child(count(4))
+			})
 			.child(div().flex_1())
 			.children(right)
 	}
@@ -1760,6 +1978,38 @@ impl Render for Workbench {
 		let editor = self.render_editor(window, cx);
 		let status = self.render_statusbar();
 		let quick = self.render_quick(window, cx);
+		let t = &self.theme;
+		// Notification toasts: bottom right, above the status bar.
+		let toasts = (!self.notifications.is_empty()).then(|| {
+			div().absolute().right(px(12.)).bottom(px(STATUS_H + 8.)).w(px(450.)).flex().flex_col().gap(px(8.)).children(self.notifications.iter().map(|(id, sev, text)| {
+				let (glyph, color) = match sev {
+					3 => (icons::ERROR, t.c("notificationsErrorIcon.foreground", 0xf14c4cff)),
+					2 => (icons::WARNING, t.c("notificationsWarningIcon.foreground", 0xcca700ff)),
+					_ => (icons::INFO, t.c("notificationsInfoIcon.foreground", 0x3794ffff)),
+				};
+				let id = *id;
+				div()
+					.id(("toast", id as usize))
+					.occlude()
+					.flex()
+					.items_center()
+					.gap(px(8.))
+					.px(px(12.))
+					.py(px(10.))
+					.rounded(px(8.))
+					.bg(t.c("notifications.background", 0x202122ff))
+					.border_1()
+					.border_color(t.c("notificationToast.border", 0x2a2b2cff))
+					.text_color(t.c("notifications.foreground", 0xbfbfbfff))
+					.shadow(vec![gpui::BoxShadow { color: gpui::rgba(0x00000026).into(), offset: gpui::point(px(0.), px(0.)), blur_radius: px(20.), spread_radius: px(0.) }])
+					.child(icon(glyph, 16., color))
+					.child(div().flex_1().child(text.clone()))
+					.child(action(icons::CLOSE, t.c("icon.foreground", 0x8c8c8cff)).id(("toast-close", id as usize)).on_click(cx.listener(move |wb, _, _, cx| {
+						wb.notifications.retain(|n| n.0 != id);
+						cx.notify();
+					})))
+			}))
+		});
 		div()
 			.relative()
 			.key_context("Workbench")
@@ -1775,6 +2025,7 @@ impl Render for Workbench {
 			.child(titlebar)
 			.child(div().flex_1().flex().gap(px(GAP)).px(px(GAP)).pb(px(GAP)).overflow_hidden().child(sidebar).child(editor))
 			.child(status)
+			.children(toasts)
 			.children(quick)
 	}
 }
@@ -1836,6 +2087,21 @@ mod tests {
 	fn completion_item_dto() {
 		assert_eq!(completion_item(&json!({ "a": "foo" })), Some(("foo".into(), "foo".into(), "foo".into())));
 		assert_eq!(completion_item(&json!({ "a": { "label": "bar" }, "h": "bar(${1})", "i": 4, "e": "1" })), Some(("bar".into(), "bar()".into(), "1".into())));
+	}
+
+	#[test]
+	fn diagnostic_ranges() {
+		assert_eq!(utf16_col_to_byte("a😀b", 1), 0);
+		assert_eq!(utf16_col_to_byte("a😀b", 4), 5); // after the surrogate pair
+		assert_eq!(utf16_col_to_byte("ab", 9), 2);
+		let m = Marker { severity: 4, message: "x".into(), source: None, start: (1, 3), end: (2, 2) };
+		let hint = Marker { severity: 1, ..m.clone() };
+		let ms = [&m, &hint];
+		assert_eq!(marker_ranges(&ms, 0, "abcdef"), [(2..6, 4)]);
+		assert_eq!(marker_ranges(&ms, 1, "xyz"), [(0..1, 4)]);
+		assert!(marker_ranges(&ms, 2, "zzz").is_empty());
+		let empty = Marker { start: (1, 2), end: (1, 2), ..m.clone() };
+		assert_eq!(marker_ranges(&[&empty], 0, "abc"), [(1..2, 4)]);
 	}
 
 	#[test]

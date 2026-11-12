@@ -44,6 +44,7 @@ pub const CHROME_CLOSE: char = '\u{eab8}';
 pub const REMOTE: char = '\u{eb3a}';
 pub const ERROR: char = '\u{ea87}';
 pub const WARNING: char = '\u{ea6c}';
+pub const INFO: char = '\u{ea74}';
 pub const BELL: char = '\u{eaa2}';
 pub const BRACKET: char = '\u{eb0f}';
 

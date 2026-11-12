@@ -22,6 +22,7 @@ fn runs_a_real_extension_command() {
 			app_root: root.canonicalize().unwrap(),
 			extensions: vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/hello-ext")],
 			data_dir: std::env::temp_dir().join("vscode-rs-exthost-test"),
+			configuration_defaults: (json!({}), Vec::new()),
 		},
 		Box::new(move |proxy, method, args| {
 			match (proxy, method) {
