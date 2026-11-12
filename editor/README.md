@@ -16,9 +16,16 @@ the extensions' `contributes.languages`.
 Linux build deps: `libxkbcommon-x11-dev libxcb1-dev libx11-xcb-dev libwayland-dev libvulkan-dev libfontconfig-dev libfreetype-dev`
 (and a Vulkan driver, e.g. `mesa-vulkan-drivers`).
 
+The workbench follows VS Code's layout pixel-for-pixel where measured (1200x800, default
+"Dark 2026" theme, modern UI): sizes come from the workbench CSS, colors from the theme file
+(with `include`s), icons from the real codicon and vs-seti fonts, fonts resolved like the
+browser does (`system-ui`, `'Droid Sans Mono', monospace`). Syntax highlighting runs the
+extensions' TextMate grammars on Oniguruma (as `vscode-textmate` does) with the theme's
+`tokenColors`, plus bracket pair colorization, indent guides and the dimmed final line number.
+
 Verified with the built-in CSS language features extension (real language server completions).
 
-Works today: open/edit/save one file, keyboard navigation, paste, mouse cursor placement,
+Works today: folder + explorer, tabs, edit/save, keyboard navigation, paste, mouse cursor placement,
 extension completions (Ctrl+Space, trigger characters, typing), document sync to extensions.
-Not yet: selections/undo, multiple files/tabs, explorer, syntax highlighting, hover,
-diagnostics, command palette, settings, themes, IME.
+Not yet: selections/undo, menus and other views (search, SCM, ...), command palette, settings UI,
+hover, diagnostics, grammar injections, semantic highlighting, IME, suggest widget kind icons.

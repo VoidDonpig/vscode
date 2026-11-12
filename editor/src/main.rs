@@ -14,10 +14,12 @@
 
 mod buffer;
 mod icons;
+mod textmate;
 mod theme;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -26,13 +28,13 @@ use code_exthost::{describe_extension, ExtHost, Options};
 use futures::channel::mpsc::{unbounded, UnboundedSender};
 use futures::StreamExt;
 use gpui::{
-	div, img, prelude::*, px, size, uniform_list, App, Application, Bounds, Context, Div, FocusHandle, FontWeight, Hsla, KeyDownEvent,
+	div, img, prelude::*, px, size, uniform_list, FontStyle, HighlightStyle, StyledText, UnderlineStyle, App, Application, Bounds, Context, Div, FocusHandle, FontWeight, Hsla, KeyDownEvent,
 	MouseButton, MouseDownEvent, ScrollStrategy, SharedString, UniformListScrollHandle, Window, WindowBounds, WindowDecorations,
 	WindowOptions,
 };
 use icons::FileIcons;
 use serde_json::{json, Value};
-use theme::Theme;
+use theme::{Theme, TokenStyle};
 
 // Workbench metrics, measured from the web workbench of this repo (1200x800, Dark 2026).
 const TITLE_H: f32 = 35.;
@@ -51,6 +53,7 @@ const GUTTER: f32 = 70.;
 const LINE_NUMBER_RIGHT: f32 = 44.;
 const MINIMAP_W: f32 = 88.;
 const SCROLLBAR_W: f32 = 14.;
+const MINIMAP_LINES: usize = 400;
 /// files.exclude defaults.
 const EXCLUDED: &[&str] = &[".git", ".svn", ".hg", ".DS_Store", "Thumbs.db", "CVS"];
 
@@ -83,6 +86,16 @@ struct Doc {
 	/// Document as the extension host last saw it: (full range, UTF-16 length).
 	synced: ((usize, usize, usize, usize), usize),
 	scroll: UniformListScrollHandle,
+	/// TextMate scope name of the language's grammar.
+	grammar: Option<String>,
+	/// Per line: styled byte ranges, tokenizer state and bracket depth at the end of the line.
+	tokens: Vec<LineTokens>,
+}
+
+struct LineTokens {
+	runs: Vec<(Range<usize>, TokenStyle)>,
+	stack: textmate::Stack,
+	bracket_depth: usize,
 }
 
 /// One `contributes.languages` entry.
@@ -100,6 +113,10 @@ struct Fonts {
 
 struct Workbench {
 	focus: FocusHandle,
+	grammars: textmate::Registry,
+	/// language id -> grammar scope name
+	language_grammars: HashMap<String, String>,
+	token_styles: HashMap<String, TokenStyle>,
 	theme: Theme,
 	file_icons: FileIcons,
 	fonts: Fonts,
@@ -156,6 +173,38 @@ fn languages_of(packages: &[Value]) -> Vec<Language> {
 			Some(Language { name, extensions: strings(&l["extensions"]), filenames: strings(&l["filenames"]), id })
 		})
 		.collect()
+}
+
+/// `contributes.grammars`: (language id -> scope name, scope name -> grammar file).
+fn grammars_of(dirs: &[PathBuf], packages: &[Value]) -> (HashMap<String, String>, HashMap<String, PathBuf>) {
+	let (mut by_lang, mut files) = (HashMap::new(), HashMap::new());
+	for (dir, p) in dirs.iter().zip(packages) {
+		for g in p["contributes"]["grammars"].as_array().into_iter().flatten() {
+			let (Some(scope), Some(path)) = (g["scopeName"].as_str(), g["path"].as_str()) else { continue };
+			files.insert(scope.to_string(), dir.join(path));
+			if let Some(lang) = g["language"].as_str() {
+				by_lang.insert(lang.to_string(), scope.to_string());
+			}
+		}
+	}
+	(by_lang, files)
+}
+
+/// Tabs shown as 4 spaces: the display text and a map from source byte to display byte.
+// shortcut: tabs expand to a fixed 4 columns, not to the next tab stop.
+fn expand_tabs(line: &str) -> (String, Vec<usize>) {
+	let mut out = String::with_capacity(line.len());
+	let mut map = Vec::with_capacity(line.len() + 1);
+	for c in line.chars() {
+		map.extend(std::iter::repeat_n(out.len(), c.len_utf8()));
+		if c == '\t' {
+			out.push_str("    ");
+		} else {
+			out.push(c);
+		}
+	}
+	map.push(out.len());
+	(out, map)
 }
 
 /// Language id for a file, like the workbench's language service (file names, then the longest matching extension).
@@ -340,7 +389,8 @@ impl Workbench {
 		let app_root = std::env::var_os("VSCODE_ROOT").map(PathBuf::from).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
 		let app_root = app_root.canonicalize().unwrap_or(app_root);
 		let ext_dirs = extension_dirs(&app_root);
-		let packages: Vec<Value> = ext_dirs.iter().filter_map(|d| describe_extension(d).ok().map(|(_, v)| v)).collect();
+		let (ext_dirs, packages): (Vec<PathBuf>, Vec<Value>) = ext_dirs.into_iter().filter_map(|d| describe_extension(&d).ok().map(|(_, v)| (d, v))).unzip();
+		let (language_grammars, grammar_files) = grammars_of(&ext_dirs, &packages);
 
 		let args: Vec<PathBuf> = args.into_iter().map(|a| std::path::absolute(&a).unwrap_or(a)).collect();
 		let files: Vec<PathBuf> = args.iter().filter(|a| !a.is_dir()).cloned().collect();
@@ -359,6 +409,9 @@ impl Workbench {
 
 		let mut wb = Workbench {
 			focus: cx.focus_handle(),
+			grammars: textmate::Registry::new(grammar_files),
+			language_grammars,
+			token_styles: HashMap::new(),
 			theme: Theme::load(&app_root.join("extensions/theme-defaults/themes/2026-dark.json")),
 			file_icons: FileIcons::load(&app_root.join("extensions/theme-seti/icons/vs-seti-icon-theme.json")),
 			fonts: system_fonts(cx),
@@ -404,7 +457,11 @@ impl Workbench {
 				version: 1,
 				dirty: false,
 				scroll: UniformListScrollHandle::new(),
+				grammar: None,
+				tokens: Vec::new(),
 			};
+			let mut doc = doc;
+			doc.grammar = self.language_grammars.get(&doc.lang).cloned();
 			if let Some(host) = &self.host {
 				send_open(host, &doc);
 				let _ = host.notify("ExtHostExtensionService", "$activateByEvent", vec![json!(format!("onLanguage:{}", doc.lang)), json!(0)]);
@@ -486,6 +543,67 @@ impl Workbench {
 		doc.synced = (doc.buf.full_range(), text.encode_utf16().count());
 		self.reveal_cursor();
 		cx.notify();
+	}
+
+	/// Tokenizes the active document up to `upto` lines (cached; edits truncate the cache).
+	fn ensure_tokens(&mut self, upto: usize) {
+		let Some(i) = self.active else { return };
+		let Some(scope) = self.docs[i].grammar.clone() else { return };
+		let upto = upto.min(self.docs[i].buf.lines.len());
+		while self.docs[i].tokens.len() < upto {
+			let n = self.docs[i].tokens.len();
+			let (mut stack, mut depth) = match self.docs[i].tokens.last() {
+				Some(t) => (t.stack.clone(), t.bracket_depth),
+				None => match self.grammars.initial_stack(&scope) {
+					Some(s) => (s, 0),
+					None => return,
+				},
+			};
+			let line = self.docs[i].buf.lines[n].clone();
+			let spans = self.grammars.tokenize_line(&line, &mut stack);
+			// Paint spans in order (inner captures after their match), then merge equal neighbours.
+			let mut per_byte = vec![TokenStyle::default(); line.len()];
+			let mut plain = vec![true; line.len()]; // not inside a string / comment / regex token
+			for (r, scopes) in spans {
+				let key = scopes.join(" ");
+				let style = *self.token_styles.entry(key).or_insert_with(|| self.theme.token_style(&scopes));
+				let skip = scopes.iter().any(|s| s.starts_with("comment") || s.starts_with("string") || s.starts_with("constant.regexp"));
+				plain[r.clone()].fill(!skip);
+				per_byte[r].fill(style);
+			}
+			// editor.bracketPairColorization: one color pool cycling by nesting depth.
+			let pool = [
+				self.theme.c("editorBracketHighlight.foreground1", 0xffd700ff),
+				self.theme.c("editorBracketHighlight.foreground2", 0xda70d6ff),
+				self.theme.c("editorBracketHighlight.foreground3", 0x179fffff),
+			];
+			for (b, ch) in line.char_indices() {
+				if !plain.get(b).copied().unwrap_or(true) {
+					continue;
+				}
+				let color = match ch {
+					'(' | '[' | '{' => {
+						depth += 1;
+						pool[(depth - 1) % 3]
+					}
+					')' | ']' | '}' if depth > 0 => {
+						depth -= 1;
+						pool[depth % 3]
+					}
+					')' | ']' | '}' => self.theme.c("editorBracketHighlight.unexpectedBracket.foreground", 0xff1212cc),
+					_ => continue,
+				};
+				per_byte[b].foreground = Some(color);
+			}
+			let mut runs: Vec<(Range<usize>, TokenStyle)> = Vec::new();
+			for (b, st) in per_byte.into_iter().enumerate() {
+				match runs.last_mut() {
+					Some((r, s)) if *s == st && r.end == b => r.end = b + 1,
+					_ => runs.push((b..b + 1, st)),
+				}
+			}
+			self.docs[i].tokens.push(LineTokens { runs, stack, bracket_depth: depth });
+		}
 	}
 
 	fn reveal_cursor(&self) {
@@ -598,6 +716,24 @@ impl Workbench {
 			}
 		}
 
+		// Re-tokenize from the line above the cursor: edits touch at most that line and below.
+		let (line_before, version_before) = self.doc().map(|d| (d.buf.cursor.0, d.version)).unwrap();
+		self.key_down_edit(k, cx);
+		if let Some(doc) = self.doc_mut() {
+			if doc.version != version_before {
+				doc.tokens.truncate(line_before.min(doc.buf.cursor.0).saturating_sub(1));
+			}
+		}
+		if self.popup.is_some() && self.visible_items().is_empty() {
+			self.popup = None;
+		}
+		self.reveal_cursor();
+		cx.notify();
+	}
+
+	fn key_down_edit(&mut self, k: &gpui::Keystroke, cx: &mut Context<Self>) {
+		let m = k.modifiers;
+		let cmd = m.control || m.platform;
 		let buf = &mut self.doc_mut().unwrap().buf;
 		match k.key.as_str() {
 			"s" if cmd => self.save(),
@@ -651,11 +787,6 @@ impl Workbench {
 			}
 			_ => {}
 		}
-		if self.popup.is_some() && self.visible_items().is_empty() {
-			self.popup = None;
-		}
-		self.reveal_cursor();
-		cx.notify();
 	}
 
 	fn click_line(&mut self, line: usize, ev: &MouseDownEvent, cx: &mut Context<Self>) {
@@ -939,12 +1070,12 @@ impl Workbench {
 	}
 
 	fn render_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+		self.ensure_tokens(MINIMAP_LINES);
 		let ts = window.text_system();
 		if let Ok(adv) = ts.advance(ts.resolve_font(&gpui::font(self.fonts.mono.clone())), px(FONT_SIZE), 'm') {
 			self.char_w = f32::from(adv.width);
 		}
 		let t = &self.theme;
-		let fg = t.c("foreground", 0xbfbfbfff);
 		let icon_fg = t.c("icon.foreground", 0x8c8c8cff);
 		let card = div()
 			.flex_1()
@@ -1029,16 +1160,28 @@ impl Workbench {
 		let line_fg = t.c("editorLineNumber.foreground", 0x858889ff);
 		let line_active = t.c("editorLineNumber.activeForeground", 0xbbbebfff);
 		let line_hl = t.c("editor.lineHighlightBackground", 0x242526ff);
+		let line_dimmed = t.colors.get("editorLineNumber.dimmedForeground").copied().unwrap_or(line_fg.opacity(0.4));
+		let indent_guide = t.c("editorIndentGuide.background1", 0x404040ff);
 		let cursor_c = t.c("editorCursor.foreground", 0xbbbebfff);
-		let minimap_fg = t.c("editor.foreground", 0xbbbebfff).opacity(0.35);
-		// shortcut: minimap draws one bar per line (no per-token colors), first 400 lines.
-		let minimap: Vec<(f32, f32)> = doc
-			.buf
-			.lines
-			.iter()
-			.take(400)
-			.map(|l| ((l.len() - l.trim_start().len()) as f32, l.trim().chars().count() as f32))
-			.collect();
+		let editor_fg = t.c("editor.foreground", 0xbbbebfff);
+		// Minimap (scale 1): each character is a 1x2px block in its token color.
+		// shortcut: only the first MINIMAP_LINES lines, and the minimap does not scroll with the editor.
+		let mut minimap: Vec<(f32, f32, f32, Hsla)> = Vec::new();
+		for (i, line) in doc.buf.lines.iter().take(MINIMAP_LINES).enumerate() {
+			let runs: Vec<(Range<usize>, Option<Hsla>)> = match doc.tokens.get(i) {
+				Some(t) => t.runs.iter().map(|(r, st)| (r.clone(), st.foreground)).collect(),
+				None => vec![(0..line.len(), None)],
+			};
+			for (r, color) in runs {
+				let col = line[..r.start].chars().count() as f32;
+				let piece = &line[r.clone()];
+				let lead = piece.chars().take_while(|c| c.is_whitespace()).count() as f32;
+				let w = piece.trim_end().chars().count() as f32 - lead;
+				if w > 0. {
+					minimap.push((i as f32 * 2., col + lead, w, color.unwrap_or(editor_fg).opacity(0.6)));
+				}
+			}
+		}
 
 		card.child(header)
 			.child(div().h(px(BREADCRUMBS_H)).flex_none().pl(px(16.)).flex().items_center().text_color(crumb_fg).children(crumbs))
@@ -1056,22 +1199,53 @@ impl Workbench {
 							"lines",
 							doc.buf.lines.len(),
 							cx.processor(move |wb, range: std::ops::Range<usize>, _window, cx| {
+								wb.ensure_tokens(range.end);
+								let char_w = wb.char_w;
 								let Some(doc) = wb.doc() else { return Vec::new() };
+								let lines = &doc.buf.lines;
+								// Indentation in levels of 4 columns; blank lines take the smaller of their neighbours (like the guides renderer).
+								let indent_of = |l: &str| l.chars().take_while(|c| c.is_whitespace()).map(|c| if c == '\t' { 4 } else { 1 }).sum::<usize>() / 4;
+								let blank = |l: &String| l.trim().is_empty();
+								let level = |ix: usize| -> usize {
+									if !blank(&lines[ix]) {
+										return indent_of(&lines[ix]);
+									}
+									let prev = lines[..ix].iter().rev().take(200).find(|l| !blank(l)).map_or(0, |l| indent_of(l));
+									let next = lines[ix + 1..].iter().take(200).find(|l| !blank(l)).map_or(0, |l| indent_of(l));
+									prev.min(next)
+								};
+								// editor.renderFinalNewline "dimmed": the empty last line's number at 40%.
+								let final_empty = lines.len() > 1 && lines.last().is_some_and(|l| l.is_empty());
 								range
 									.map(|ix| {
-										let text = doc.buf.lines[ix].replace('\t', "    ");
+										let line = &doc.buf.lines[ix];
+										let (text, map) = expand_tabs(line);
+										let highlights: Vec<(Range<usize>, HighlightStyle)> = doc
+											.tokens
+											.get(ix)
+											.into_iter()
+											.flat_map(|t| &t.runs)
+											.map(|(r, st)| {
+												let style = HighlightStyle {
+													color: st.foreground,
+													font_weight: st.bold.then_some(FontWeight::BOLD),
+													font_style: st.italic.then_some(FontStyle::Italic),
+													underline: st.underline.then(|| UnderlineStyle { thickness: px(1.), ..Default::default() }),
+													..Default::default()
+												};
+												(map[r.start]..map[r.end], style)
+											})
+											.collect();
+										let styled = StyledText::new(text).with_highlights(highlights);
+										// shortcut: indent guides are all drawn inactive (no active-block highlight).
+										let guides = (0..level(ix)).map(|k| div().absolute().top_0().bottom_0().left(px((k * 4) as f32 * char_w)).w(px(1.)).bg(indent_guide));
+										let content = div().relative().flex_1().h_full().children(guides).child(styled);
 										let content = if ix == cl {
-											let at = text.char_indices().nth(cc).map_or(text.len(), |(i, _)| i);
-											div()
-												.flex()
-												.flex_1()
-												.h_full()
-												.bg(line_hl)
-												.child(text[..at].to_string())
-												.child(div().w(px(2.)).h_full().bg(cursor_c))
-												.child(text[at..].to_string())
+											// shortcut: the caret x assumes a monospace grid (wide CJK glyphs are off).
+											let col: usize = line.chars().take(cc).map(|c| if c == '\t' { 4 } else { 1 }).sum();
+											content.bg(line_hl).child(div().absolute().top_0().left(px(col as f32 * char_w)).w(px(2.)).h_full().bg(cursor_c))
 										} else {
-											div().flex_1().child(text)
+											content
 										};
 										div()
 											.id(ix)
@@ -1093,7 +1267,13 @@ impl Workbench {
 													.pr(px(GUTTER - LINE_NUMBER_RIGHT))
 													.flex()
 													.justify_end()
-													.text_color(if ix == cl { line_active } else { line_fg })
+													.text_color(if ix == cl {
+														line_active
+													} else if final_empty && ix + 1 == lines.len() {
+														line_dimmed
+													} else {
+														line_fg
+													})
 													.child((ix + 1).to_string()),
 											)
 											.child(content)
@@ -1112,8 +1292,8 @@ impl Workbench {
 							minimap
 								.into_iter()
 								.enumerate()
-								.filter(|(_, (_, w))| *w > 0.)
-								.map(|(i, (x, w))| div().absolute().top(px(i as f32 * 2.)).left(px(x)).w(px(w.min(MINIMAP_W - x))).h(px(2.)).bg(minimap_fg)),
+								.filter(|(_, (_, x, _, _))| *x < MINIMAP_W)
+								.map(|(_, (y, x, w, c))| div().absolute().top(px(y)).left(px(x)).w(px(w.min(MINIMAP_W - x))).h(px(2.)).bg(c)),
 						),
 					)
 					.when(!items.is_empty(), |d| {
@@ -1251,6 +1431,13 @@ mod tests {
 	fn completion_item_dto() {
 		assert_eq!(completion_item(&json!({ "a": "foo" })), Some(("foo".into(), "foo".into(), "foo".into())));
 		assert_eq!(completion_item(&json!({ "a": { "label": "bar" }, "h": "bar(${1})", "i": 4, "e": "1" })), Some(("bar".into(), "bar()".into(), "1".into())));
+	}
+
+	#[test]
+	fn tabs_map_bytes() {
+		let (text, map) = expand_tabs("\tä=1");
+		assert_eq!(text, "    ä=1");
+		assert_eq!(map, [0, 4, 4, 6, 7, 8]);
 	}
 
 	#[test]
