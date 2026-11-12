@@ -14,6 +14,7 @@
 
 mod buffer;
 mod icons;
+mod quickinput;
 mod textmate;
 mod theme;
 
@@ -130,6 +131,56 @@ struct Workbench {
 	providers: Vec<Provider>,
 	popup: Option<Popup>,
 	char_w: f32,
+	quick: Option<Quick>,
+	ext_commands: Vec<quickinput::ExtensionCommand>,
+	sidebar_visible: bool,
+}
+
+/// Quick Open / Command Palette state. A query starting with '>' lists commands.
+struct Quick {
+	query: String,
+	selected: usize,
+	files: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Builtin {
+	Save,
+	CloseEditor,
+	Undo,
+	Redo,
+	SelectAll,
+	TriggerSuggest,
+	QuickOpen,
+	ToggleSidebar,
+}
+
+/// Workbench commands implemented natively: (label, keybinding, command).
+const BUILTINS: &[(&str, &[&str], Builtin)] = &[
+	("File: Save", &["Ctrl", "S"], Builtin::Save),
+	("View: Close Editor", &["Ctrl", "W"], Builtin::CloseEditor),
+	("Edit: Undo", &["Ctrl", "Z"], Builtin::Undo),
+	("Edit: Redo", &["Ctrl", "Y"], Builtin::Redo),
+	("Selection: Select All", &["Ctrl", "A"], Builtin::SelectAll),
+	("Trigger Suggest", &["Ctrl", "Space"], Builtin::TriggerSuggest),
+	("Go to File...", &["Ctrl", "P"], Builtin::QuickOpen),
+	("View: Toggle Primary Side Bar Visibility", &["Ctrl", "B"], Builtin::ToggleSidebar),
+];
+
+#[derive(Clone)]
+enum QuickAction {
+	Open(PathBuf),
+	Builtin(Builtin),
+	Extension(String),
+}
+
+struct QuickItem {
+	label: String,
+	description: String,
+	file: bool,
+	keys: &'static [&'static str],
+	hits: Vec<usize>,
+	action: QuickAction,
 }
 
 fn file_uri(path: &Path) -> Value {
@@ -391,6 +442,8 @@ impl Workbench {
 		let ext_dirs = extension_dirs(&app_root);
 		let (ext_dirs, packages): (Vec<PathBuf>, Vec<Value>) = ext_dirs.into_iter().filter_map(|d| describe_extension(&d).ok().map(|(_, v)| (d, v))).unzip();
 		let (language_grammars, grammar_files) = grammars_of(&ext_dirs, &packages);
+		let mut ext_commands: Vec<quickinput::ExtensionCommand> = ext_dirs.iter().zip(&packages).flat_map(|(d, p)| quickinput::extension_commands(d, p)).collect();
+		ext_commands.sort_by(|a, b| a.label.cmp(&b.label));
 
 		let args: Vec<PathBuf> = args.into_iter().map(|a| std::path::absolute(&a).unwrap_or(a)).collect();
 		let files: Vec<PathBuf> = args.iter().filter(|a| !a.is_dir()).cloned().collect();
@@ -425,6 +478,9 @@ impl Workbench {
 			providers: Vec::new(),
 			popup: None,
 			char_w: FONT_SIZE * 0.6,
+			quick: None,
+			ext_commands,
+			sidebar_visible: true,
 		};
 		for f in files {
 			wb.open(f, cx);
@@ -683,10 +739,146 @@ impl Workbench {
 		}
 	}
 
-	fn key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+	fn open_quick(&mut self, query: String, cx: &mut Context<Self>) {
+		let files = self.root.as_ref().map(|r| quickinput::workspace_files(r, EXCLUDED, 20_000)).unwrap_or_default();
+		self.quick = Some(Quick { query, selected: 0, files });
+		self.popup = None;
+		cx.notify();
+	}
+
+	/// Rows for the current query: files (most recently opened first when empty) or commands.
+	fn quick_items(&self) -> Vec<QuickItem> {
+		let Some(q) = &self.quick else { return Vec::new() };
+		if let Some(cmd_query) = q.query.strip_prefix('>') {
+			let cmd_query = cmd_query.trim();
+			let builtins = BUILTINS.iter().map(|(label, keys, b)| (label.to_string(), *keys, QuickAction::Builtin(*b)));
+			let ext = self.ext_commands.iter().map(|c| (c.label.clone(), &[][..], QuickAction::Extension(c.id.clone())));
+			let mut items: Vec<QuickItem> = builtins
+				.chain(ext)
+				.filter_map(|(label, keys, action)| {
+					let (_, hits) = quickinput::fuzzy(cmd_query, &label)?;
+					Some(QuickItem { label, description: String::new(), file: false, keys, hits, action })
+				})
+				.collect();
+			items.sort_by(|a, b| a.label.cmp(&b.label));
+			return items;
+		}
+		let rel = |p: &Path| -> String {
+			let parent = p.parent().unwrap_or(Path::new(""));
+			self.root.as_ref().and_then(|r| parent.strip_prefix(r).ok()).unwrap_or(parent).to_string_lossy().to_string()
+		};
+		let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+		if q.query.is_empty() {
+			// "recently opened": editors, most recent first
+			return self.docs.iter().rev().map(|d| QuickItem { label: name(&d.path), description: rel(&d.path), file: true, keys: &[], hits: Vec::new(), action: QuickAction::Open(d.path.clone()) }).collect();
+		}
+		let mut scored: Vec<(i32, QuickItem)> = q
+			.files
+			.iter()
+			.filter_map(|p| {
+				let label = name(p);
+				let (score, hits) = quickinput::fuzzy(&q.query, &label).or_else(|| quickinput::fuzzy(&q.query, &format!("{}/{}", rel(p), label)).map(|(s, _)| (s - 10, Vec::new())))?;
+				Some((score, QuickItem { label, description: rel(p), file: true, keys: &[], hits, action: QuickAction::Open(p.clone()) }))
+			})
+			.collect();
+		scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.label.len().cmp(&b.1.label.len())));
+		scored.into_iter().take(500).map(|(_, i)| i).collect()
+	}
+
+	fn run_quick(&mut self, action: QuickAction, window: &mut Window, cx: &mut Context<Self>) {
+		self.quick = None;
+		match action {
+			QuickAction::Open(p) => self.open(p, cx),
+			QuickAction::Builtin(b) => self.run_builtin(b, cx),
+			QuickAction::Extension(id) => {
+				if let Some(host) = self.host.clone() {
+					cx.background_spawn(async move {
+						let _ = host.call("ExtHostExtensionService", "$activateByEvent", vec![json!(format!("onCommand:{id}")), json!(0)]);
+						if let Err(e) = host.call("ExtHostCommands", "$executeContributedCommand", vec![json!(id)]) {
+							eprintln!("code-native: command {id} failed: {e}");
+						}
+					})
+					.detach();
+				}
+			}
+		}
+		window.focus(&self.focus);
+		cx.notify();
+	}
+
+	fn run_builtin(&mut self, b: Builtin, cx: &mut Context<Self>) {
+		let edit = |wb: &mut Self, f: fn(&mut Buffer) -> bool, cx: &mut Context<Self>| {
+			if let Some(doc) = wb.doc_mut() {
+				if f(&mut doc.buf) {
+					doc.tokens.clear();
+					wb.edited(cx);
+				}
+			}
+		};
+		match b {
+			Builtin::Save => self.save(),
+			Builtin::CloseEditor => {
+				if let Some(i) = self.active {
+					self.close(i, cx);
+				}
+			}
+			Builtin::Undo => edit(self, Buffer::undo, cx),
+			Builtin::Redo => edit(self, Buffer::redo, cx),
+			Builtin::SelectAll => {
+				if let Some(doc) = self.doc_mut() {
+					doc.buf.select_all();
+				}
+			}
+			Builtin::TriggerSuggest => self.request_completions(None, cx),
+			Builtin::QuickOpen => self.open_quick(String::new(), cx),
+			Builtin::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
+		}
+		cx.notify();
+	}
+
+	fn quick_key(&mut self, k: &gpui::Keystroke, window: &mut Window, cx: &mut Context<Self>) {
+		let n = self.quick_items().len();
+		let Some(q) = self.quick.as_mut() else { return };
+		match k.key.as_str() {
+			"escape" => {
+				self.quick = None;
+				window.focus(&self.focus);
+			}
+			"up" => q.selected = q.selected.saturating_sub(1),
+			"down" => q.selected = (q.selected + 1).min(n.saturating_sub(1)),
+			"enter" => {
+				let sel = q.selected;
+				if let Some(item) = self.quick_items().into_iter().nth(sel) {
+					return self.run_quick(item.action, window, cx);
+				}
+			}
+			"backspace" => {
+				q.query.pop();
+				q.selected = 0;
+			}
+			_ if !(k.modifiers.control || k.modifiers.platform || k.modifiers.alt) => {
+				if let Some(ch) = &k.key_char {
+					q.query.push_str(ch);
+					q.selected = 0;
+				}
+			}
+			_ => {}
+		}
+		cx.notify();
+	}
+
+	fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
 		let k = &ev.keystroke;
 		let m = k.modifiers;
 		let cmd = m.control || m.platform;
+		match k.key.as_str() {
+			"p" if cmd => return self.open_quick(if m.shift { ">".into() } else { String::new() }, cx),
+			"b" if cmd => return self.run_builtin(Builtin::ToggleSidebar, cx),
+			_ => {}
+		}
+		if self.quick.is_some() {
+			return self.quick_key(k, window, cx);
+		}
 		if k.key == "w" && cmd {
 			if let Some(i) = self.active {
 				self.close(i, cx);
@@ -830,7 +1022,7 @@ impl Workbench {
 
 	/// Editor position under a window x coordinate on `line`.
 	fn column_at(&self, line: usize, x: f32) -> (usize, usize) {
-		let text_left = GAP + ACTIVITY_W + SIDEBAR_W + GAP + 1. + GUTTER;
+		let text_left = GAP + ACTIVITY_W + if self.sidebar_visible { SIDEBAR_W } else { 0. } + GAP + 1. + GUTTER;
 		let display_col = ((x - text_left) / self.char_w).round().max(0.) as usize;
 		// map display columns (tabs = 4) back to characters
 		let mut col = 0;
@@ -973,7 +1165,10 @@ impl Workbench {
 							.border_1()
 							.border_color(t.c("commandCenter.border", 0x2e3031ff))
 							.bg(t.c("commandCenter.background", 0x191a1bff))
-							.child(title),
+							.child(title)
+							.id("command-center")
+							.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+							.on_click(cx.listener(|wb, _, _, cx| wb.open_quick(String::new(), cx))),
 					),
 			)
 			.child(div().flex_1())
@@ -1111,7 +1306,7 @@ impl Workbench {
 					.child(activity(icons::ACCOUNT, false))
 					.child(activity(icons::SETTINGS_GEAR, false)),
 			)
-			.child(
+			.when(self.sidebar_visible, |d| d.child(
 				// side bar: Explorer
 				div()
 					.w(px(SIDEBAR_W))
@@ -1141,7 +1336,7 @@ impl Workbench {
 					.child(div().id("explorer").flex_1().flex().flex_col().overflow_y_scroll().children(explorer_rows))
 					.child(div().border_t_1().border_color(border).mx(px(8.)).child(section("Outline", false).h(px(27.))))
 					.child(div().border_t_1().border_color(border).mx(px(8.)).mb(px(5.)).child(section("Timeline", false).h(px(27.)))),
-			)
+			))
 	}
 
 	fn render_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -1438,13 +1633,135 @@ impl Workbench {
 	}
 }
 
+impl Workbench {
+	/// Quick input widget, measured from the workbench: 602px wide, 6px from the top, 26px input,
+	/// 22px rows, at most 40% of the window tall.
+	fn render_quick(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+		let q = self.quick.as_ref()?;
+		let t = &self.theme;
+		let items = self.quick_items();
+		let width = f32::from(window.viewport_size().width);
+		let max_rows = ((f32::from(window.viewport_size().height) * 0.4) / ROW_H).floor().max(1.) as usize;
+		let first = q.selected.saturating_sub(max_rows - 1);
+		let fg = t.c("quickInput.foreground", 0xbfbfbfff);
+		let focus_bg = t.c("quickInputList.focusBackground", 0x297aa0ff);
+		let focus_fg = t.c("quickInputList.focusForeground", 0xffffffff);
+		let desc_fg = t.c("descriptionForeground", 0x8c8c8cff);
+		let hl = t.colors.get("list.highlightForeground").copied();
+		let commands = q.query.starts_with('>');
+		let keycap = |k: &str| {
+			div()
+				.px(px(5.))
+				.h(px(18.))
+				.flex()
+				.items_center()
+				.rounded(px(3.))
+				.text_size(px(11.))
+				.bg(t.c("keybindingLabel.background", 0x8080802b))
+				.text_color(t.c("keybindingLabel.foreground", 0xccccccff))
+				.border_b_1()
+				.border_color(t.c("keybindingLabel.bottomBorder", 0x0000005c))
+				.child(k.to_string())
+		};
+		let rows = items.iter().enumerate().skip(first).take(max_rows).map(|(i, item)| {
+			let focused = i == q.selected;
+			let row_fg = if focused { focus_fg } else { fg };
+			let highlights: Vec<(Range<usize>, HighlightStyle)> = item
+				.hits
+				.iter()
+				.filter_map(|&c| {
+					let (b, ch) = item.label.char_indices().nth(c)?;
+					Some((b..b + ch.len_utf8(), HighlightStyle { font_weight: Some(FontWeight::BOLD), color: if focused { None } else { hl }, ..Default::default() }))
+				})
+				.collect();
+			let action = item.action.clone();
+			div()
+				.id(("quick", i))
+				.h(px(ROW_H))
+				.mx(px(6.))
+				.pl(px(9.))
+				.pr(px(4.))
+				.flex()
+				.items_center()
+				.gap(px(6.))
+				.rounded(px(4.))
+				.text_color(row_fg)
+				.when(focused, |d| d.bg(focus_bg))
+				.when(item.file, |d| d.child(self.file_icon(&item.label, &language_for(Path::new(&item.label), &self.languages))))
+				.child(StyledText::new(item.label.clone()).with_highlights(highlights))
+				.when(!item.description.is_empty(), |d| d.child(div().text_size(px(UI_SIZE * 0.9)).text_color(if focused { focus_fg } else { desc_fg }).child(item.description.clone())))
+				.child(div().flex_1())
+				.when(i == 0 && item.file && q.query.is_empty(), |d| d.child(div().text_size(px(11.)).text_color(t.c("pickerGroup.foreground", 0xbfbfbfff)).child("recently opened")))
+				.when(!item.keys.is_empty(), |d| {
+					d.child(div().flex().items_center().gap(px(4.)).children(item.keys.iter().enumerate().flat_map(|(n, k)| {
+						let mut v = Vec::new();
+						if n > 0 {
+							v.push(div().text_size(px(11.)).child("+"));
+						}
+						v.push(keycap(k));
+						v
+					})))
+				})
+				.on_click(cx.listener(move |wb, _, window, cx| wb.run_quick(action.clone(), window, cx)))
+		});
+		let list_h = (items.len().min(max_rows) as f32 * ROW_H + 7.).min(max_rows as f32 * ROW_H + 1.);
+		let placeholder = if commands { "" } else { "Search files by name (append : to go to line or @ to go to symbol)" };
+		Some(
+			div()
+				.absolute()
+				.size_full()
+				.child(div().id("quick-backdrop").absolute().size_full().on_mouse_down(MouseButton::Left, cx.listener(|wb, _, window, cx| {
+					wb.quick = None;
+					window.focus(&wb.focus);
+					cx.notify();
+				})))
+				.child(
+					div()
+						.id("quick-input")
+						.occlude()
+						.absolute()
+						.top(px(6.))
+						.left(px(((width - 602.) / 2.).floor()))
+						.w(px(602.))
+						.flex()
+						.flex_col()
+						.bg(t.c("quickInput.background", 0x202122ff))
+						.text_color(fg)
+						.border_1()
+						.border_color(t.c("widget.border", 0x2a2b2cff))
+						.rounded(px(8.))
+						.shadow(vec![gpui::BoxShadow { color: gpui::rgba(0x00000026).into(), offset: gpui::point(px(0.), px(0.)), blur_radius: px(20.), spread_radius: px(0.) }])
+						.child(
+							div().pt(px(6.)).px(px(6.)).pb(px(4.)).child(
+								div()
+									.h(px(26.))
+									.px(px(6.))
+									.flex()
+									.items_center()
+									.rounded(px(6.))
+									.bg(t.c("input.background", 0x191a1bff))
+									.border_1()
+									.border_color(t.c("focusBorder", 0x3994bcb3))
+									.child(q.query.clone())
+									.child(div().w(px(1.)).h(px(17.)).bg(fg))
+									.when(q.query.is_empty(), |d| d.child(div().ml(px(-1.)).text_color(t.c("input.placeholderForeground", 0x8c8c8cff)).child(placeholder))),
+							),
+						)
+						.when(!items.is_empty(), |d| d.child(div().mt(px(2.)).h(px(list_h)).overflow_hidden().children(rows))),
+				),
+		)
+	}
+}
+
 impl Render for Workbench {
 	fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
 		let titlebar = self.render_titlebar(window, cx);
 		let sidebar = self.render_sidebar(cx);
 		let editor = self.render_editor(window, cx);
 		let status = self.render_statusbar();
+		let quick = self.render_quick(window, cx);
 		div()
+			.relative()
 			.key_context("Workbench")
 			.track_focus(&self.focus)
 			.on_key_down(cx.listener(Self::key_down))
@@ -1458,6 +1775,7 @@ impl Render for Workbench {
 			.child(titlebar)
 			.child(div().flex_1().flex().gap(px(GAP)).px(px(GAP)).pb(px(GAP)).overflow_hidden().child(sidebar).child(editor))
 			.child(status)
+			.children(quick)
 	}
 }
 
