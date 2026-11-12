@@ -4,6 +4,6 @@
 	"version": "0.0.1",
 	"engines": { "vscode": "*" },
 	"main": "./extension.js",
-	"activationEvents": ["onCommand:hello.greet"],
+	"activationEvents": ["onCommand:hello.greet", "onLanguage:plaintext"],
 	"contributes": { "commands": [{ "command": "hello.greet", "title": "Greet" }] }
 }

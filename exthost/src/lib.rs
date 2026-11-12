@@ -164,8 +164,9 @@ fn push_long(b: &mut Vec<u8>, s: &[u8]) {
 	b.extend_from_slice(s);
 }
 
-pub fn encode_request(req: u32, rpc_id: u8, method: &str, args: &[Value]) -> Vec<u8> {
-	let mut b = header(1, req);
+/// `cancellable`: the callee's last parameter is a CancellationToken, which the receiver appends.
+pub fn encode_request(req: u32, rpc_id: u8, method: &str, args: &[Value], cancellable: bool) -> Vec<u8> {
+	let mut b = header(if cancellable { 2 } else { 1 }, req);
 	b.push(rpc_id);
 	b.push(method.len() as u8);
 	b.extend_from_slice(method.as_bytes());
@@ -395,22 +396,31 @@ impl ExtHost {
 		write_frame(&mut w.stream, FRAME_REGULAR, id, self.incoming_id.load(Ordering::SeqCst), body)
 	}
 
-	fn send_request(&self, req: u32, proxy: &str, method: &str, args: Vec<Value>) -> io::Result<()> {
+	fn send_request(&self, req: u32, proxy: &str, method: &str, args: Vec<Value>, cancellable: bool) -> io::Result<()> {
 		let rpc = rpc_id(proxy).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("unknown proxy {proxy}")))?;
-		self.send_raw(&encode_request(req, rpc, method, &args))
+		self.send_raw(&encode_request(req, rpc, method, &args, cancellable))
 	}
 
 	/// Fire-and-forget call (for `void` methods).
 	pub fn notify(&self, proxy: &str, method: &str, args: Vec<Value>) -> io::Result<()> {
-		self.send_request(self.next_req.fetch_add(1, Ordering::SeqCst), proxy, method, args)
+		self.send_request(self.next_req.fetch_add(1, Ordering::SeqCst), proxy, method, args, false)
 	}
 
 	/// Calls `proxy.method(...args)` in the extension host and blocks for the reply.
 	pub fn call(&self, proxy: &str, method: &str, args: Vec<Value>) -> Result<Option<Value>, String> {
+		self.request(proxy, method, args, false)
+	}
+
+	/// Like `call`, for methods whose last parameter is a CancellationToken (e.g. `$provideCompletionItems`).
+	pub fn call_cancellable(&self, proxy: &str, method: &str, args: Vec<Value>) -> Result<Option<Value>, String> {
+		self.request(proxy, method, args, true)
+	}
+
+	fn request(&self, proxy: &str, method: &str, args: Vec<Value>, cancellable: bool) -> Result<Option<Value>, String> {
 		let (tx, rx) = channel();
 		let req = self.next_req.fetch_add(1, Ordering::SeqCst);
 		self.pending.lock().unwrap().insert(req, tx);
-		if let Err(e) = self.send_request(req, proxy, method, args) {
+		if let Err(e) = self.send_request(req, proxy, method, args, cancellable) {
 			self.pending.lock().unwrap().remove(&req);
 			return Err(e.to_string());
 		}
@@ -438,7 +448,7 @@ mod tests {
 
 	#[test]
 	fn request_and_reply_roundtrip() {
-		let buf = encode_request(7, 10, "$registerCommand", &[json!("hello.greet")]);
+		let buf = encode_request(7, 10, "$registerCommand", &[json!("hello.greet")], false);
 		assert_eq!(decode(&buf).unwrap(), Message::Request { req: 7, rpc_id: 10, method: "$registerCommand".into(), args: vec![json!("hello.greet")] });
 		assert_eq!(decode(&encode_reply(3, &Ok(Some(json!({"a": 1}))))).unwrap(), Message::Reply { req: 3, result: Ok(Some(json!({"a": 1}))) });
 		assert_eq!(decode(&encode_reply(4, &Ok(None))).unwrap(), Message::Reply { req: 4, result: Ok(None) });
