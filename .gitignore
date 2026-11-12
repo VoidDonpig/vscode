@@ -31,6 +31,7 @@ vscode.db
 /copilot_shim/target
 /desktop/target
 /exthost/target
+/editor/target
 product.overrides.json
 *.snap.actual
 *.tsbuildinfo
