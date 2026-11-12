@@ -48,8 +48,8 @@ struct Provider {
 }
 
 struct Popup {
-	/// (label, text to insert)
-	items: Vec<(String, String)>,
+	/// (label, text to insert, sort key)
+	items: Vec<(String, String, String)>,
 	selected: usize,
 }
 
@@ -118,14 +118,15 @@ fn selector_matches(selector: &Value, lang: &str, scheme: &str) -> bool {
 	})
 }
 
-/// Converts one `ISuggestDataDto` into (label, insert text).
-fn completion_item(item: &Value) -> Option<(String, String)> {
+/// Converts one `ISuggestDataDto` into (label, insert text, sort key).
+fn completion_item(item: &Value) -> Option<(String, String, String)> {
 	let label = item["a"].as_str().or_else(|| item["a"]["label"].as_str())?.to_string();
 	let mut insert = item["h"].as_str().unwrap_or(&label).to_string();
 	if item["i"].as_u64().unwrap_or(0) & 4 != 0 {
 		insert = strip_snippet(&insert);
 	}
-	Some((label, insert))
+	let sort = item["e"].as_str().unwrap_or(&label).to_string();
+	Some((label, insert, sort))
 }
 
 // shortcut: snippets are inserted as plain text (placeholders keep their default text, no tab stops).
@@ -311,16 +312,12 @@ impl Editor {
 		.detach();
 	}
 
-	/// Items matching the word before the cursor.
+	/// Items matching the word before the cursor: prefix matches first, then the extension's sortText.
 	fn visible_items(&self) -> Vec<(String, String)> {
 		let prefix = self.buf.word_prefix().to_lowercase();
-		self.popup
-			.iter()
-			.flat_map(|p| &p.items)
-			.filter(|(label, _)| label.to_lowercase().contains(&prefix))
-			.take(12)
-			.cloned()
-			.collect()
+		let mut items: Vec<_> = self.popup.iter().flat_map(|p| &p.items).filter(|(label, ..)| label.to_lowercase().contains(&prefix)).collect();
+		items.sort_by_key(|(label, _, sort)| (!label.to_lowercase().starts_with(&prefix), sort.as_str()));
+		items.into_iter().take(12).map(|(label, insert, _)| (label.clone(), insert.clone())).collect()
 	}
 
 	fn save(&mut self) {
@@ -608,7 +605,7 @@ mod tests {
 
 	#[test]
 	fn completion_item_dto() {
-		assert_eq!(completion_item(&json!({ "a": "foo" })), Some(("foo".into(), "foo".into())));
-		assert_eq!(completion_item(&json!({ "a": { "label": "bar" }, "h": "bar(${1})", "i": 4 })), Some(("bar".into(), "bar()".into())));
+		assert_eq!(completion_item(&json!({ "a": "foo" })), Some(("foo".into(), "foo".into(), "foo".into())));
+		assert_eq!(completion_item(&json!({ "a": { "label": "bar" }, "h": "bar(${1})", "i": 4, "e": "1" })), Some(("bar".into(), "bar()".into(), "1".into())));
 	}
 }

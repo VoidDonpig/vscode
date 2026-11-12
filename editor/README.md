@@ -16,6 +16,8 @@ the extensions' `contributes.languages`.
 Linux build deps: `libxkbcommon-x11-dev libxcb1-dev libx11-xcb-dev libwayland-dev libvulkan-dev libfontconfig-dev libfreetype-dev`
 (and a Vulkan driver, e.g. `mesa-vulkan-drivers`).
 
+Verified with the built-in CSS language features extension (real language server completions).
+
 Works today: open/edit/save one file, keyboard navigation, paste, mouse cursor placement,
 extension completions (Ctrl+Space, trigger characters, typing), document sync to extensions.
 Not yet: selections/undo, multiple files/tabs, explorer, syntax highlighting, hover,
