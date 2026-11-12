@@ -716,8 +716,8 @@ impl Workbench {
 			}
 		}
 
-		// Re-tokenize from the line above the cursor: edits touch at most that line and below.
-		let (line_before, version_before) = self.doc().map(|d| (d.buf.cursor.0, d.version)).unwrap();
+		// Re-tokenize from the line above the first touched line (selection start or cursor).
+		let (line_before, version_before) = self.doc().map(|d| (d.buf.anchor.map_or(d.buf.cursor.0, |a| a.0.min(d.buf.cursor.0)), d.version)).unwrap();
 		self.key_down_edit(k, cx);
 		if let Some(doc) = self.doc_mut() {
 			if doc.version != version_before {
@@ -734,22 +734,61 @@ impl Workbench {
 	fn key_down_edit(&mut self, k: &gpui::Keystroke, cx: &mut Context<Self>) {
 		let m = k.modifiers;
 		let cmd = m.control || m.platform;
+		let shift = m.shift;
+		let page = 30;
 		let buf = &mut self.doc_mut().unwrap().buf;
 		match k.key.as_str() {
 			"s" if cmd => self.save(),
 			"space" if cmd => self.request_completions(None, cx),
+			"a" if cmd => buf.select_all(),
+			"c" | "x" if cmd => {
+				// editor.emptySelectionClipboard: without a selection, the whole line.
+				let text = buf.selected_text().unwrap_or_else(|| format!("{}\n", buf.lines[buf.cursor.0]));
+				cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+				if k.key == "x" {
+					if !buf.delete_selection() {
+						let l = buf.cursor.0;
+						buf.set_cursor((l, 0), false);
+						buf.set_cursor((l + 1, 0), true);
+						if buf.selection().is_none() || l + 1 >= buf.lines.len() {
+							// last line: take it up to its end (and the newline before it, if any)
+							buf.set_cursor((l, 0), false);
+							buf.end(true);
+						}
+						buf.delete_selection();
+					}
+					self.edited(cx);
+				}
+			}
 			"v" if cmd => {
 				if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
 					buf.insert(&text.replace("\r\n", "\n"));
 					self.edited(cx);
 				}
 			}
-			"left" => buf.move_by(0, -1),
-			"right" => buf.move_by(0, 1),
-			"up" => buf.move_by(-1, 0),
-			"down" => buf.move_by(1, 0),
-			"home" => buf.home(),
-			"end" => buf.end(),
+			"z" if cmd && !shift => {
+				if buf.undo() {
+					self.doc_mut().unwrap().tokens.clear();
+					self.edited(cx);
+				}
+			}
+			"y" | "z" if cmd => {
+				if buf.redo() {
+					self.doc_mut().unwrap().tokens.clear();
+					self.edited(cx);
+				}
+			}
+			"left" | "right" if cmd => buf.move_word(k.key == "right", shift),
+			"home" if cmd => buf.set_cursor((0, 0), shift),
+			"end" if cmd => buf.set_cursor((usize::MAX, usize::MAX), shift),
+			"left" => buf.move_by(0, -1, shift),
+			"right" => buf.move_by(0, 1, shift),
+			"up" => buf.move_by(-1, 0, shift),
+			"down" => buf.move_by(1, 0, shift),
+			"pageup" => buf.move_by(-page, 0, shift),
+			"pagedown" => buf.move_by(page, 0, shift),
+			"home" => buf.home(shift),
+			"end" => buf.end(shift),
 			"backspace" => {
 				buf.backspace();
 				self.edited(cx);
@@ -766,7 +805,7 @@ impl Workbench {
 				buf.insert("    ");
 				self.edited(cx);
 			}
-			"escape" => {}
+			"escape" => buf.set_cursor(buf.cursor, false),
 			// shortcut: text arrives via key_char, so IME composition is not supported yet (needs gpui's InputHandler).
 			_ if !cmd && !m.alt => {
 				if let Some(ch) = k.key_char.clone() {
@@ -789,14 +828,50 @@ impl Workbench {
 		}
 	}
 
-	fn click_line(&mut self, line: usize, ev: &MouseDownEvent, cx: &mut Context<Self>) {
+	/// Editor position under a window x coordinate on `line`.
+	fn column_at(&self, line: usize, x: f32) -> (usize, usize) {
 		let text_left = GAP + ACTIVITY_W + SIDEBAR_W + GAP + 1. + GUTTER;
-		let col = ((f32::from(ev.position.x) - text_left) / self.char_w).round().max(0.) as usize;
+		let display_col = ((x - text_left) / self.char_w).round().max(0.) as usize;
+		// map display columns (tabs = 4) back to characters
+		let mut col = 0;
+		let mut acc = 0;
+		if let Some(doc) = self.doc() {
+			for c in doc.buf.lines[line].chars() {
+				let w = if c == '\t' { 4 } else { 1 };
+				if acc + w / 2 >= display_col && acc + w > display_col {
+					break;
+				}
+				acc += w;
+				col += 1;
+			}
+		}
+		(line, col)
+	}
+
+	fn click_line(&mut self, line: usize, ev: &MouseDownEvent, cx: &mut Context<Self>) {
+		let pos = self.column_at(line, f32::from(ev.position.x));
 		if let Some(doc) = self.doc_mut() {
-			doc.buf.cursor = (line, col.min(doc.buf.lines[line].chars().count()));
+			if ev.click_count >= 2 {
+				doc.buf.select_word(pos);
+			} else {
+				doc.buf.set_cursor(pos, ev.modifiers.shift);
+			}
 		}
 		self.popup = None;
 		cx.notify();
+	}
+
+	fn drag_line(&mut self, line: usize, ev: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+		if ev.pressed_button != Some(MouseButton::Left) {
+			return;
+		}
+		let pos = self.column_at(line, f32::from(ev.position.x));
+		if let Some(doc) = self.doc_mut() {
+			if doc.buf.cursor != pos {
+				doc.buf.set_cursor(pos, true);
+				cx.notify();
+			}
+		}
 	}
 
 	fn file_icon(&self, name: &str, lang: &str) -> Div {
@@ -1162,6 +1237,7 @@ impl Workbench {
 		let line_hl = t.c("editor.lineHighlightBackground", 0x242526ff);
 		let line_dimmed = t.colors.get("editorLineNumber.dimmedForeground").copied().unwrap_or(line_fg.opacity(0.4));
 		let indent_guide = t.c("editorIndentGuide.background1", 0x404040ff);
+		let selection_bg = t.c("editor.selectionBackground", 0x264f78ff);
 		let cursor_c = t.c("editorCursor.foreground", 0xbbbebfff);
 		let editor_fg = t.c("editor.foreground", 0xbbbebfff);
 		// Minimap (scale 1): each character is a 1x2px block in its token color.
@@ -1214,6 +1290,8 @@ impl Workbench {
 									let next = lines[ix + 1..].iter().take(200).find(|l| !blank(l)).map_or(0, |l| indent_of(l));
 									prev.min(next)
 								};
+								let selection = doc.buf.selection();
+								let display_col = |line: &str, chars: usize| -> f32 { line.chars().take(chars).map(|c| if c == '\t' { 4. } else { 1. }).sum::<f32>() * char_w };
 								// editor.renderFinalNewline "dimmed": the empty last line's number at 40%.
 								let final_empty = lines.len() > 1 && lines.last().is_some_and(|l| l.is_empty());
 								range
@@ -1239,11 +1317,19 @@ impl Workbench {
 										let styled = StyledText::new(text).with_highlights(highlights);
 										// shortcut: indent guides are all drawn inactive (no active-block highlight).
 										let guides = (0..level(ix)).map(|k| div().absolute().top_0().bottom_0().left(px((k * 4) as f32 * char_w)).w(px(1.)).bg(indent_guide));
-										let content = div().relative().flex_1().h_full().children(guides).child(styled);
+										// Selection: from the start column (or 0) to the end column (or past the line end, for the newline).
+										let sel = selection.filter(|((sl, _), (el, _))| (*sl..=*el).contains(&ix)).map(|((sl, sc), (el, ec))| {
+											let x0 = if ix == sl { display_col(line, sc) } else { 0. };
+											let x1 = if ix == el { display_col(line, ec) } else { display_col(line, usize::MAX) + char_w };
+											div().absolute().top_0().bottom_0().left(px(x0)).w(px((x1 - x0).max(0.))).bg(selection_bg)
+										});
+										let content = div().relative().flex_1().h_full().children(sel).children(guides).child(styled);
 										let content = if ix == cl {
 											// shortcut: the caret x assumes a monospace grid (wide CJK glyphs are off).
 											let col: usize = line.chars().take(cc).map(|c| if c == '\t' { 4 } else { 1 }).sum();
-											content.bg(line_hl).child(div().absolute().top_0().left(px(col as f32 * char_w)).w(px(2.)).h_full().bg(cursor_c))
+											content
+												.when(selection.is_none(), |d| d.bg(line_hl))
+												.child(div().absolute().top_0().left(px(col as f32 * char_w)).w(px(2.)).h_full().bg(cursor_c))
 										} else {
 											content
 										};
@@ -1260,6 +1346,7 @@ impl Workbench {
 													wb.click_line(ix, ev, cx)
 												}),
 											)
+											.on_mouse_move(cx.listener(move |wb, ev, _, cx| wb.drag_line(ix, ev, cx)))
 											.child(
 												div()
 													.w(px(GUTTER))
