@@ -1,0 +1,9 @@
+{
+	"name": "hello-ext",
+	"publisher": "rusttest",
+	"version": "0.0.1",
+	"engines": { "vscode": "*" },
+	"main": "./extension.js",
+	"activationEvents": ["onCommand:hello.greet"],
+	"contributes": { "commands": [{ "command": "hello.greet", "title": "Greet" }] }
+}

@@ -30,6 +30,7 @@ vscode.db
 /cli/openssl
 /copilot_shim/target
 /desktop/target
+/exthost/target
 product.overrides.json
 *.snap.actual
 *.tsbuildinfo
