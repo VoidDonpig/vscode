@@ -100,6 +100,7 @@ fn main() {
 
 	event_loop.run(move |event, _, control_flow| {
 		*control_flow = ControlFlow::Wait;
+		// shortcut: server is only killed on window close, not on SIGTERM/crash; add a signal handler if orphans show up.
 		if let Event::WindowEvent { event: WindowEvent::CloseRequested, .. } = event {
 			let _ = server.kill();
 			let _ = server.wait();
